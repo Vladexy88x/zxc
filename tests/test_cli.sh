@@ -271,6 +271,45 @@ else
     log_fail "Integrity check PASSED on corrupt file (False Negative)"
 fi
 
+# 9b. Checksum presence in -l comes from the header flag
+echo "Testing archive checksum detection (-l)..."
+EMPTY="$TEST_DIR/empty"
+: > "$EMPTY"
+"$ZXC_BIN" -z -k -f -C "$EMPTY"
+if ! wait_for_file "$EMPTY.zxc"; then
+    log_fail "Could not create empty archive $EMPTY.zxc"
+fi
+
+# Stored hash is zero, but the archive still carries a checksum
+LIST_OUT=$("$ZXC_BIN" -l -j "$EMPTY.zxc")
+if [[ "$LIST_OUT" == *'"checksum_method": "RapidHash"'* ]] &&
+   [[ "$LIST_OUT" == *'"checksum_value": "0x00000000"'* ]]; then
+    log_pass "-l reports the checksum of an empty -C archive"
+else
+    log_fail "-l should report a checksum on an empty -C archive: $LIST_OUT"
+fi
+
+LIST_OUT=$("$ZXC_BIN" -l -v "$EMPTY.zxc")
+if [[ "$LIST_OUT" == *"Checksum Method: RapidHash"* ]]; then
+    log_pass "-l -v reports the checksum of an empty -C archive"
+else
+    log_fail "-l -v should report a checksum on an empty -C archive: $LIST_OUT"
+fi
+
+# A -N archive carries no checksum
+NOCK="$TEST_DIR/nochecksum"
+head -c 200000 "${TEST_FILE}.orig" > "$NOCK"
+"$ZXC_BIN" -z -k -f -N "$NOCK"
+if ! wait_for_file "$NOCK.zxc"; then
+    log_fail "Could not create no-checksum archive $NOCK.zxc"
+fi
+LIST_OUT=$("$ZXC_BIN" -l -j "$NOCK.zxc")
+if [[ "$LIST_OUT" == *'"checksum_method": "none"'* ]]; then
+    log_pass "-l reports no checksum for a -N archive"
+else
+    log_fail "-l should report no checksum for a -N archive: $LIST_OUT"
+fi
+
 # 10. Global Checksum Integrity
 echo "Testing Global Checksum Integrity..."
 "$ZXC_BIN" -z -k -f -C "$TEST_FILE_ARG"
