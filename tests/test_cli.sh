@@ -310,6 +310,92 @@ else
     log_fail "-l should report no checksum for a -N archive: $LIST_OUT"
 fi
 
+# 9c. Integrity Check reports the archive's checksum, not the -C/-N flag
+echo "Testing Integrity Check checksum reporting..."
+
+# -N archive from 9b: nothing to verify
+OUT=$("$ZXC_BIN" -t -v "$NOCK.zxc" 2>&1)
+if [[ "$OUT" == *": OK"* ]] && [[ "$OUT" == *"not verified (archive has none)"* ]]; then
+    log_pass "-t says a -N archive carries no checksum to verify"
+else
+    log_fail "-t claims the checksum was verified on an archive that carries none: $OUT"
+fi
+
+OUT=$("$ZXC_BIN" -t -j "$NOCK.zxc" 2>&1)
+if [[ "$OUT" == *'"checksum_verified": false'* ]] &&
+   [[ "$OUT" == *'"checksum_method": "none"'* ]]; then
+    log_pass "-t -j reports checksum_verified=false, method none for a -N archive"
+else
+    log_fail "-t -j reports a verified checksum for an archive that carries none: $OUT"
+fi
+
+# A corrupted -N archive must never be reported as checksum-verified
+BAD="$TEST_DIR/nochecksum_bad.zxc"
+cp "$NOCK.zxc" "$BAD"
+BAD_SZ=$(wc -c < "$BAD" | tr -d ' ')
+printf '\x5a' | dd of="$BAD" bs=1 seek=$((BAD_SZ / 2)) count=1 conv=notrunc 2>/dev/null
+set +e
+OUT=$("$ZXC_BIN" -t -v "$BAD" 2>&1)
+OUTJ=$("$ZXC_BIN" -t -j "$BAD" 2>&1)
+set -e
+if [[ "$OUT" != *"verified (RapidHash)"* ]] && [[ "$OUTJ" != *'"checksum_verified": true'* ]]; then
+    log_pass "-t does not vouch for a corrupted -N archive"
+else
+    log_fail "-t reports a corrupted -N archive as checksum-verified: $OUT / $OUTJ"
+fi
+
+# Section 9 corrupted the shared archive; recreate it
+"$ZXC_BIN" -z -k -f -C "$TEST_FILE_ARG"
+
+# Piped input: checksum unknown, and the pipe still decodes
+set +e
+OUT=$(cat "$TEST_FILE_XC_ARG" | "$ZXC_BIN" -t -v - 2>&1)
+RET=$?
+OUTJ=$(cat "$TEST_FILE_XC_ARG" | "$ZXC_BIN" -t -j - 2>&1)
+set -e
+if [[ $RET -eq 0 ]] && [[ "$OUT" == *": OK"* ]] &&
+   [[ "$OUT" == *"unknown (streamed input)"* ]] &&
+   [[ "$OUTJ" == *'"checksum_verified": false'* ]] &&
+   [[ "$OUTJ" == *'"checksum_method": "unknown"'* ]]; then
+    log_pass "-t on a pipe reads the archive and reports an unknown checksum"
+else
+    log_fail "-t on a pipe should succeed and report an unknown checksum (exit $RET): $OUT / $OUTJ"
+fi
+
+# A -C archive is still verified
+OUT=$("$ZXC_BIN" -t -v "$TEST_FILE_XC_ARG" 2>&1)
+OUTJ=$("$ZXC_BIN" -t -j "$TEST_FILE_XC_ARG" 2>&1)
+if [[ "$OUT" == *"verified (RapidHash)"* ]] &&
+   [[ "$OUTJ" == *'"checksum_verified": true'* ]] &&
+   [[ "$OUTJ" == *'"checksum_method": "RapidHash"'* ]]; then
+    log_pass "-t still reports a checksummed archive as verified"
+else
+    log_fail "-t should report a -C archive as checksum-verified: $OUT / $OUTJ"
+fi
+
+# -N on a -C archive: checksum present but skipped, exit status still 0
+set +e
+OUT=$("$ZXC_BIN" -t -v -N "$TEST_FILE_XC_ARG" 2>&1)
+RET=$?
+OUTJ=$("$ZXC_BIN" -t -j -N "$TEST_FILE_XC_ARG" 2>&1)
+set -e
+if [[ $RET -eq 0 ]] && [[ "$OUT" == *"not verified (skipped by -N)"* ]] &&
+   [[ "$OUTJ" == *'"checksum_verified": false'* ]] &&
+   [[ "$OUTJ" == *'"checksum_method": "RapidHash"'* ]]; then
+    log_pass "-t -N distinguishes a skipped check from an absent checksum"
+else
+    log_fail "-t -N should report the archive checksum as present but unchecked (exit $RET): $OUT / $OUTJ"
+fi
+
+# Empty -C archive from 9b (zero stored hash)
+OUTJ=$("$ZXC_BIN" -t -j "$EMPTY.zxc" 2>&1)
+if [[ "$OUTJ" == *'"checksum_method": "RapidHash"'* ]] &&
+   [[ "$OUTJ" == *'"checksum_verified": true'* ]]; then
+    log_pass "-t reports the checksum of an empty -C archive"
+else
+    log_fail "-t should verify the checksum of an empty -C archive: $OUTJ"
+fi
+
 # 10. Global Checksum Integrity
 echo "Testing Global Checksum Integrity..."
 "$ZXC_BIN" -z -k -f -C "$TEST_FILE_ARG"

@@ -33,6 +33,8 @@ By default, **zxc** compresses a single *INPUT-FILE*. If no *OUTPUT-FILE* is pro
 
 **-t**, **--test**
 : Test the integrity of a compressed FILE. It decodes the file and verifies its checksum (if present) without writing any output.
+: What is reported about the checksum describes the archive, not the command line. An archive records in its header whether it carries a checksum, so **-t** distinguishes three outcomes: the checksum was verified, the archive carries none to verify, or **-N** declined to check the one it has. Reading from a pipe the header cannot be re-read, and the checksum is reported as unknown. A valid archive exits 0 in all four cases: **-t** verifies everything it was asked to.
+: Under **-j**, `checksum_verified` is true only when a checksum was actually checked, and `checksum_method` names what the archive carries: `RapidHash` or `none`, spelled as in **-l** **-j**, or `unknown` when the header could not be read because the archive was streamed.
 
 **-b**, **--bench** [*N*]
 : Benchmark in-memory performance. Loads the input file entirely into RAM and measures raw algorithm throughput (default duration is 5 seconds).
