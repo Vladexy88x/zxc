@@ -881,22 +881,19 @@ static int zxc_list_archive(const char* path, int json_output) {
 /**
  * @brief Reports whether an archive's header declares a global checksum.
  *
- * Opens @p path separately: reading the stream about to be decoded would be
- * discarded by the later setvbuf(), and decoding would start past the header.
+ * Reads the header from @p f and rewinds it to the start, where decoding
+ * begins, so the checksum status describes the same file that is decoded.
  *
- * @param[in] path Path to the archive (not stdin).
+ * @param[in] f Seekable input stream for the archive (not stdin).
  * @return 1 if declared, 0 if not, -1 if the header could not be read.
  */
-static int zxc_archive_has_checksum(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return -1;
-
+static int zxc_archive_has_checksum(FILE* f) {
     uint8_t header[ZXC_FILE_HEADER_SIZE];
     int declared = -1;
-    if (fread(header, 1, ZXC_FILE_HEADER_SIZE, f) == ZXC_FILE_HEADER_SIZE)
+    if (fseeko(f, 0, SEEK_SET) == 0 &&
+        fread(header, 1, ZXC_FILE_HEADER_SIZE, f) == ZXC_FILE_HEADER_SIZE)
         declared = (header[6] & ZXC_FILE_FLAG_HAS_CHECKSUM) != 0;
-
-    fclose(f);
+    if (fseeko(f, 0, SEEK_SET) != 0) declared = -1;
     return declared;
 }
 
@@ -1049,12 +1046,6 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     }
 #endif
 
-    // -t reports the checksum the archive carries; stdin can't be re-read for it
-    int archive_has_checksum = -1;  // -1 unknown, 0 none declared, 1 declared
-    if (mode == MODE_INTEGRITY && !use_stdin) {
-        archive_has_checksum = zxc_archive_has_checksum(resolved_in_path);
-    }
-
     // Determine if we should show progress bar and get file size
     // IMPORTANT: This must be done BEFORE setting large buffers with setvbuf
     // to avoid buffer inconsistency issues when reading the footer
@@ -1091,6 +1082,10 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     char* b2 = malloc(ZXC_STDIO_BUFFER_SIZE);
     if (b1) setvbuf(f_in, b1, _IOFBF, ZXC_STDIO_BUFFER_SIZE);
     if (f_out && b2) setvbuf(f_out, b2, _IOFBF, ZXC_STDIO_BUFFER_SIZE);
+
+    // -t reports the checksum the archive carries; stdin can't be re-read for it
+    int archive_has_checksum = -1;  // -1 unknown, 0 none declared, 1 declared
+    if (mode == MODE_INTEGRITY && !use_stdin) archive_has_checksum = zxc_archive_has_checksum(f_in);
 
     if (mode == MODE_COMPRESS)
         zxc_log_v("Processing %s... (Compression Level %d)\n", in_path ? in_path : "<stdin>",
