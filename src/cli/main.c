@@ -377,6 +377,9 @@ typedef enum {
 
 enum { OPT_VERSION = 1000, OPT_HELP, OPT_TRAIN_DICT, OPT_PROGRESS };
 
+// File header flags byte, bit 7 (docs/FORMAT.md 3.1); private to zxc_internal.h
+#define ZXC_FILE_FLAG_HAS_CHECKSUM 0x80U
+
 // Forward declaration for recursive mode
 static int process_single_file(const char* in_path, const char* out_path_override, zxc_mode_t mode,
                                int num_threads, int keep_input, int force, int to_stdout,
@@ -804,10 +807,11 @@ static int zxc_list_archive(const char* path, int json_output) {
     }
     fclose(f);
 
-    // Parse checksum (if non-zero, checksum was enabled)
+    // Presence is the header flag: the stored hash is zero for an empty input
+    const int has_checksum = (header[6] & ZXC_FILE_FLAG_HAS_CHECKSUM) != 0;
     const uint32_t stored_checksum = footer[8] | ((uint32_t)footer[9] << 8) |
                                      ((uint32_t)footer[10] << 16) | ((uint32_t)footer[11] << 24);
-    const char* checksum_method = (stored_checksum != 0) ? "RapidHash" : "-";
+    const char* checksum_method = has_checksum ? "RapidHash" : "-";
 
     // Dictionary ID (from header flag bit 6 + bytes 7-10)
     const uint32_t dict_id = zxc_get_dict_id(header, ZXC_FILE_HEADER_SIZE);
@@ -842,7 +846,7 @@ static int zxc_list_archive(const char* path, int json_output) {
             "  \"dict_id\": %s%s%s\n"
             "}\n",
             path, file_size, (long long)uncompressed_size, ratio, format_version, block_size_kb,
-            (stored_checksum != 0) ? "RapidHash" : "none", stored_checksum, dict_id ? "\"" : "",
+            has_checksum ? "RapidHash" : "none", stored_checksum, dict_id ? "\"" : "",
             dict_id ? dict_id_str : "null", dict_id ? "\"" : "");
     } else if (g_verbose) {
         // Verbose mode: detailed vertical layout
@@ -852,9 +856,9 @@ static int zxc_list_archive(const char* path, int json_output) {
             "Block Format: %u\n"
             "Block Size:   %zu KB\n"
             "Checksum Method: %s\n",
-            path, format_version, block_size_kb, (stored_checksum != 0) ? "RapidHash" : "None");
+            path, format_version, block_size_kb, has_checksum ? "RapidHash" : "None");
 
-        if (stored_checksum != 0) printf("Checksum Value:  0x%08X\n", stored_checksum);
+        if (has_checksum) printf("Checksum Value:  0x%08X\n", stored_checksum);
         if (dict_id) printf("Dictionary ID:   %s\n", dict_id_str);
 
         printf(
@@ -872,6 +876,25 @@ static int zxc_list_archive(const char* path, int json_output) {
     }
 
     return 0;
+}
+
+/**
+ * @brief Reports whether an archive's header declares a global checksum.
+ *
+ * Reads the header from @p f and rewinds it to the start, where decoding
+ * begins, so the checksum status describes the same file that is decoded.
+ *
+ * @param[in] f Seekable input stream for the archive (not stdin).
+ * @return 1 if declared, 0 if not, -1 if the header could not be read.
+ */
+static int zxc_archive_has_checksum(FILE* f) {
+    uint8_t header[ZXC_FILE_HEADER_SIZE];
+    int declared = -1;
+    if (fseeko(f, 0, SEEK_SET) == 0 &&
+        fread(header, 1, ZXC_FILE_HEADER_SIZE, f) == ZXC_FILE_HEADER_SIZE)
+        declared = (header[6] & ZXC_FILE_FLAG_HAS_CHECKSUM) != 0;
+    if (fseeko(f, 0, SEEK_SET) != 0) declared = -1;
+    return declared;
 }
 
 static int process_single_file(const char* in_path, const char* out_path_override, zxc_mode_t mode,
@@ -1060,12 +1083,18 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     if (b1) setvbuf(f_in, b1, _IOFBF, ZXC_STDIO_BUFFER_SIZE);
     if (f_out && b2) setvbuf(f_out, b2, _IOFBF, ZXC_STDIO_BUFFER_SIZE);
 
+    // -t reports the checksum the archive carries; stdin can't be re-read for it
+    int archive_has_checksum = -1;  // -1 unknown, 0 none declared, 1 declared
+    if (mode == MODE_INTEGRITY && !use_stdin) archive_has_checksum = zxc_archive_has_checksum(f_in);
+
     if (mode == MODE_COMPRESS)
         zxc_log_v("Processing %s... (Compression Level %d)\n", in_path ? in_path : "<stdin>",
                   level);
     else
         zxc_log_v("Processing %s...\n", in_path ? in_path : "<stdin>");
-    if (g_verbose) zxc_log("Checksum: %s\n", checksum_enabled ? "enabled" : "disabled");
+    // Not in -t: its result line reports the archive's checksum instead
+    if (g_verbose && mode != MODE_INTEGRITY)
+        zxc_log("Checksum: %s\n", checksum_enabled ? "enabled" : "disabled");
     if (g_verbose && seekable) zxc_log("Seekable: enabled\n");
 
     // Prepare progress context
@@ -1139,22 +1168,32 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     if (bytes >= 0) {
         if (mode == MODE_INTEGRITY) {
             // Test mode: show result
+            // checksum_method uses the same spellings as -l -j
+            const int verified = (archive_has_checksum > 0) && checksum_enabled;
+            const char* method = (archive_has_checksum > 0)    ? "RapidHash"
+                                 : (archive_has_checksum == 0) ? "none"
+                                                               : "unknown";
+            const char* summary = (archive_has_checksum == 0)  ? "not verified (archive has none)"
+                                  : !checksum_enabled          ? "not verified (skipped by -N)"
+                                  : (archive_has_checksum > 0) ? "verified (RapidHash)"
+                                  : use_stdin                  ? "unknown (streamed input)"
+                                                               : "unknown (header unreadable)";
             if (json_output) {
                 printf(
                     "{\n"
                     "  \"filename\": \"%s\",\n"
                     "  \"status\": \"ok\",\n"
                     "  \"checksum_verified\": %s,\n"
+                    "  \"checksum_method\": \"%s\",\n"
                     "  \"time_seconds\": %.6f\n"
                     "}\n",
-                    in_path ? in_path : "<stdin>", checksum_enabled ? "true" : "false", dt);
+                    in_path ? in_path : "<stdin>", verified ? "true" : "false", method, dt);
             } else if (g_verbose) {
                 printf(
                     "%s: OK\n"
                     "  Checksum:     %s\n"
                     "  Time:         %.3fs\n",
-                    in_path ? in_path : "<stdin>",
-                    checksum_enabled ? "verified (RapidHash)" : "not verified", dt);
+                    in_path ? in_path : "<stdin>", summary, dt);
             } else {
                 printf("%s: OK\n", in_path ? in_path : "<stdin>");
             }
