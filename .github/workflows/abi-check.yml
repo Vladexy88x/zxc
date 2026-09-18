@@ -12,7 +12,7 @@ on:
           - check
           - regenerate
   pull_request:
-    branches: [ main ]
+    branches: [ main, candidate ]
     paths:
       - 'src/lib/**'
       - 'include/**'
@@ -125,9 +125,11 @@ jobs:
           #   Consumers only ever hold pointers to these, so growing them is ABI-compatible.
           #   See docs/abi/libzxc.suppr for the full rationale.
           set +e
-          abidiff --no-added-syms --suppressions "$SUPPR" "$BASELINE" build/current.abi.xml | tee abi-report.txt
+          abidiff --no-added-syms --suppressions "$SUPPR" "$BASELINE" build/current.abi.xml \
+            > abi-report.txt 2>&1
           STATUS=$?
           set -e
+          cat abi-report.txt
 
           {
             echo "## ABI diff vs baseline"
@@ -138,9 +140,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # abidiff exit codes:
-          #   0           = compatible
-          #   bit 2 (4)   = ABI incompatible change  -> fail
-          #   bit 3 (8)   = ABI compatible change    -> pass (we report it)
+          #   0           = ABI compatible (no change) -> pass
+          #   bit 2 (4)   = ABI incompatible (change)  -> fail
+          #   bit 3 (8)   = ABI compatible (change)    -> pass
           if [ $((STATUS & 4)) -ne 0 ]; then
             echo "::error::ABI break detected — bump SOVERSION and regenerate the baseline."
             exit 1
