@@ -255,6 +255,58 @@ int test_io_failures() {
     return 1;
 }
 
+// Checks that a write error deferred by stdio buffering still fails the call.
+// A small output never leaves the FILE buffer before the library returns, so
+// every fwrite succeeds and only the final flush reaches /dev/full (ENOSPC).
+int test_io_deferred_write_failure(void) {
+    printf("=== TEST: Unit - Deferred Write Failure (/dev/full) ===\n");
+#if defined(__linux__)
+    uint8_t src[1000];
+    gen_lz_data(src, sizeof(src));
+
+    FILE* f_in = tmpfile();
+    FILE* f_arc = tmpfile();
+    FILE* f_full_c = fopen("/dev/full", "wb");
+    FILE* f_full_d = fopen("/dev/full", "wb");
+    if (!f_in || !f_arc || !f_full_c || !f_full_d) {
+        printf("  [SKIP] /dev/full or tmpfile unavailable\n\n");
+        if (f_in) fclose(f_in);
+        if (f_arc) fclose(f_arc);
+        if (f_full_c) fclose(f_full_c);
+        if (f_full_d) fclose(f_full_d);
+        return 1;
+    }
+    fwrite(src, 1, sizeof(src), f_in);
+
+    zxc_compress_opts_t copts = {.n_threads = 1};
+    zxc_decompress_opts_t dopts = {.n_threads = 1};
+
+    rewind(f_in);
+    const int64_t c_full = zxc_stream_compress(f_in, f_full_c, &copts);
+    rewind(f_in);
+    const int64_t c_ok = zxc_stream_compress(f_in, f_arc, &copts);
+    rewind(f_arc);
+    const int64_t d_full = zxc_stream_decompress(f_arc, f_full_d, &dopts);
+
+    fclose(f_in);
+    fclose(f_arc);
+    fclose(f_full_c);
+    fclose(f_full_d);
+
+    if (c_full != ZXC_ERROR_IO || c_ok <= 0 || d_full != ZXC_ERROR_IO) {
+        printf(
+            "Failed: compress->/dev/full %lld, compress->tmpfile %lld, "
+            "decompress->/dev/full %lld (expected %d, >0, %d)\n",
+            (long long)c_full, (long long)c_ok, (long long)d_full, ZXC_ERROR_IO, ZXC_ERROR_IO);
+        return 0;
+    }
+    printf("PASS\n\n");
+#else
+    printf("  [SKIP] needs /dev/full (Linux)\n\n");
+#endif
+    return 1;
+}
+
 // Checks thread selector behavior
 int test_thread_params() {
     printf("=== TEST: Unit - Thread Parameters ===\n");

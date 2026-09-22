@@ -128,6 +128,20 @@ pub enum StreamError {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Closes the output FILE*, reporting a failure: close() can fail on its own
+/// (e.g. deferred write errors on NFS), after the library already flushed.
+unsafe fn close_output(f: *mut libc::FILE) -> io::Result<()> {
+    if unsafe { libc::fclose(f) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // On Windows this reads GetLastError(), not the CRT errno fclose sets.
+    if err.raw_os_error() == Some(0) {
+        return Err(io::Error::other("failed to close output file"));
+    }
+    Err(err)
+}
+
 /// Convert a Rust File to a C FILE* for read operations.
 ///
 /// This function duplicates the file descriptor before passing it to fdopen,
@@ -371,14 +385,14 @@ pub fn compress_file_with_options<P: AsRef<Path>>(
         );
 
         // Always close C FILE handles (they own duplicated fds)
+        let closed = close_output(c_out);
         libc::fclose(c_in);
-        libc::fclose(c_out);
 
         if result < 0 {
-            Err(StreamError::BufferError(error_from_code(result)))
-        } else {
-            Ok(result as u64)
+            return Err(StreamError::BufferError(error_from_code(result)));
         }
+        closed?;
+        Ok(result as u64)
     }
 }
 
@@ -462,14 +476,14 @@ pub fn decompress_file_with_options<P: AsRef<Path>>(
         );
 
         // Always close C FILE handles (they own duplicated fds)
+        let closed = close_output(c_out);
         libc::fclose(c_in);
-        libc::fclose(c_out);
 
         if result < 0 {
-            Err(StreamError::BufferError(error_from_code(result)))
-        } else {
-            Ok(result as u64)
+            return Err(StreamError::BufferError(error_from_code(result)));
         }
+        closed?;
+        Ok(result as u64)
     }
 }
 
@@ -677,5 +691,26 @@ mod tests {
         let _ = fs::remove_file(&input_path);
         let _ = fs::remove_file(&compressed_path);
         let _ = fs::remove_file(&output_path);
+    }
+
+    // A small output stays in the stdio buffer until the final flush, the only
+    // write that reaches /dev/full (ENOSPC): it must still surface as an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_file_write_failure_at_flush() {
+        let input_path = temp_path("flush_input.bin");
+        let compressed_path = temp_path("flush_compressed.zxc");
+
+        let data: Vec<u8> = (0..1000).map(|i| (i % 7) as u8).collect();
+        fs::write(&input_path, &data).unwrap();
+        compress_file(&input_path, &compressed_path, Level::Default, None, None).unwrap();
+
+        let r = compress_file(input_path.as_str(), "/dev/full", Level::Default, None, None);
+        assert!(r.is_err(), "compress to /dev/full reported {r:?}");
+        let r = decompress_file(compressed_path.as_str(), "/dev/full", None);
+        assert!(r.is_err(), "decompress to /dev/full reported {r:?}");
+
+        let _ = fs::remove_file(&input_path);
+        let _ = fs::remove_file(&compressed_path);
     }
 }

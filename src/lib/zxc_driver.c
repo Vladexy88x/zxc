@@ -949,6 +949,11 @@ static int64_t zxc_stream_engine_run(FILE* f_in, FILE* f_out, const int n_thread
     else if (mode == 0 && !ctx.io_error)
         zxc_stream_finish_decompress(&ctx, &w_args, f_in, d_global_hash, checksum_enabled);
 
+    // stdio defers write errors to flush time: push the last buffer to the OS
+    // so a failure (ENOSPC, EFBIG, EPIPE) is reported here instead of being
+    // left to the caller's fclose, after a success count was returned.
+    if (!ctx.io_error && f_out && fflush(f_out) != 0) ctx.io_error = 1;
+
     ZXC_FREE(w_args.seek_comp);
     ZXC_FREE(workers);
     ZXC_ALIGNED_FREE(mem_block);

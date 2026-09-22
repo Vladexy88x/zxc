@@ -92,6 +92,7 @@ static const test_entry_t g_tests[] = {
     TEST_CASE(test_invalid_arguments),
     TEST_CASE(test_truncated_input),
     TEST_CASE(test_io_failures),
+    TEST_CASE(test_io_deferred_write_failure),
     TEST_CASE(test_thread_params),
     TEST_CASE(test_multithread_roundtrip),
     TEST_CASE(test_stream_get_decompressed_size_errors),

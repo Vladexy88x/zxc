@@ -65,6 +65,11 @@ extern "C" {
  *
  * @return Total compressed bytes written, or a negative @ref zxc_error_t
  *         (e.g. @ref ZXC_ERROR_IO).
+ *
+ * @note @p f_out is flushed before returning, so a write error that stdio
+ *       buffering would otherwise defer (e.g. disk full) is reported as
+ *       @ref ZXC_ERROR_IO. @p f_out is left open: still check the result of
+ *       your own @c fclose(), which can fail on its own (e.g. on NFS).
  */
 ZXC_EXPORT int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_compress_opts_t* opts);
 
@@ -79,6 +84,8 @@ ZXC_EXPORT int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_compre
  *
  * @return Total decompressed bytes written, or a negative @ref zxc_error_t
  *         (e.g. @ref ZXC_ERROR_BAD_HEADER).
+ *
+ * @note @p f_out is flushed before returning; see @ref zxc_stream_compress.
  */
 ZXC_EXPORT int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out,
                                          const zxc_decompress_opts_t* opts);
