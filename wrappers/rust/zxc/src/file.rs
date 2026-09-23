@@ -134,12 +134,35 @@ unsafe fn close_output(f: *mut libc::FILE) -> io::Result<()> {
     if unsafe { libc::fclose(f) } == 0 {
         return Ok(());
     }
+    Err(close_error())
+}
+
+#[cfg(unix)]
+fn close_error() -> io::Error {
     let err = io::Error::last_os_error();
-    // On Windows this reads GetLastError(), not the CRT errno fclose sets.
     if err.raw_os_error() == Some(0) {
-        return Err(io::Error::other("failed to close output file"));
+        return io::Error::other("failed to close output file");
     }
-    Err(err)
+    err
+}
+
+/// fclose() reports through the CRT errno, not GetLastError(), so
+/// last_os_error() would return an unrelated Win32 value. CRT errno values are
+/// not Win32 codes either, so they cannot go through from_raw_os_error().
+#[cfg(windows)]
+fn close_error() -> io::Error {
+    unsafe extern "C" {
+        fn _errno() -> *mut libc::c_int;
+    }
+    let code = unsafe { *_errno() };
+    if code == 0 {
+        return io::Error::other("failed to close output file");
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(code)) };
+    io::Error::other(format!(
+        "failed to close output file: {}",
+        msg.to_string_lossy()
+    ))
 }
 
 /// Convert a Rust File to a C FILE* for read operations.
