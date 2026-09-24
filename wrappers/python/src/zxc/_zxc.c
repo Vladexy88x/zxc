@@ -566,14 +566,21 @@ static PyObject* pyzxc_stream_compress(PyObject* self, PyObject* args, PyObject*
         scopts.dict_huf = dict_huf;
     }
 
+    int out_rc, out_errno = 0;
     Py_BEGIN_ALLOW_THREADS nwritten = zxc_stream_compress(fsrc, fdst, &scopts);
+    /* The library flushed fdst; close() can still fail on its own (e.g. NFS). */
+    out_rc = fclose(fdst);
+    if (out_rc != 0) out_errno = errno;
     Py_END_ALLOW_THREADS
 
-        fclose(fdst);
-    fclose(fsrc);
+        fclose(fsrc);
     if (have_dict) PyBuffer_Release(&dict_view);
 
     if (nwritten < 0) Py_Return_Err(PyExc_RuntimeError, zxc_error_name((int)nwritten));
+    if (out_rc != 0) {
+        errno = out_errno;
+        Py_Return_Errno(PyExc_OSError);
+    }
 
     return Py_BuildValue("L", nwritten);
 }
@@ -628,13 +635,20 @@ static PyObject* pyzxc_stream_decompress(PyObject* self, PyObject* args, PyObjec
     sdopts.n_threads = nthreads;
     sdopts.checksum_enabled = checksum;
 
+    int out_rc, out_errno = 0;
     Py_BEGIN_ALLOW_THREADS nwritten = zxc_stream_decompress(fsrc, fdst, &sdopts);
+    /* The library flushed fdst; close() can still fail on its own (e.g. NFS). */
+    out_rc = fclose(fdst);
+    if (out_rc != 0) out_errno = errno;
     Py_END_ALLOW_THREADS
 
-        fclose(fdst);
-    fclose(fsrc);
+        fclose(fsrc);
 
     if (nwritten < 0) Py_Return_Err(PyExc_RuntimeError, zxc_error_name((int)nwritten));
+    if (out_rc != 0) {
+        errno = out_errno;
+        Py_Return_Errno(PyExc_OSError);
+    }
 
     return Py_BuildValue("L", nwritten);
 }

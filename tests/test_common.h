@@ -107,6 +107,7 @@ int test_stream_oversized_dict(void);
 int test_invalid_arguments(void);
 int test_truncated_input(void);
 int test_io_failures(void);
+int test_io_deferred_write_failure(void);
 int test_thread_params(void);
 int test_multithread_roundtrip(void);
 int test_stream_get_decompressed_size_errors(void);

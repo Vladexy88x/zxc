@@ -7,6 +7,11 @@
 
 #include "test_common.h"
 
+#if !defined(_WIN32)
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 // Checks that the stream decompression can accept NULL output (Integrity Check Mode)
 int test_null_output_decompression() {
     printf("=== TEST: Unit - NULL Output Decompression (Integrity Check) ===\n");
@@ -252,6 +257,75 @@ int test_io_failures() {
     fclose(f_in);
     fclose(f_out);
     remove(bad_filename);
+    return 1;
+}
+
+#if !defined(_WIN32)
+// A writable FILE* whose reader is gone: every write to it fails (EPIPE).
+static FILE* open_closed_pipe(void) {
+    int fds[2];
+    if (pipe(fds) != 0) return NULL;
+    close(fds[0]);
+    FILE* f = fdopen(fds[1], "wb");
+    if (!f) close(fds[1]);
+    return f;
+}
+#endif
+
+// Checks that a write error deferred by stdio buffering still fails the call.
+// A small output never leaves the FILE buffer before the library returns, so
+// every fwrite succeeds and only the final flush reaches the closed pipe.
+int test_io_deferred_write_failure(void) {
+    printf("=== TEST: Unit - Deferred Write Failure (closed pipe) ===\n");
+#if !defined(_WIN32)
+    uint8_t src[1000];
+    gen_lz_data(src, sizeof(src));
+
+    // Report EPIPE instead of killing the process with SIGPIPE.
+    void (*prev_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    FILE* f_in = tmpfile();
+    FILE* f_arc = tmpfile();
+    FILE* f_pipe_c = open_closed_pipe();
+    FILE* f_pipe_d = open_closed_pipe();
+    if (!f_in || !f_arc || !f_pipe_c || !f_pipe_d) {
+        printf("  [SKIP] pipe or tmpfile unavailable\n\n");
+        if (f_in) fclose(f_in);
+        if (f_arc) fclose(f_arc);
+        if (f_pipe_c) fclose(f_pipe_c);
+        if (f_pipe_d) fclose(f_pipe_d);
+        signal(SIGPIPE, prev_sigpipe);
+        return 1;
+    }
+    fwrite(src, 1, sizeof(src), f_in);
+
+    zxc_compress_opts_t copts = {.n_threads = 1};
+    zxc_decompress_opts_t dopts = {.n_threads = 1};
+
+    rewind(f_in);
+    const int64_t c_pipe = zxc_stream_compress(f_in, f_pipe_c, &copts);
+    rewind(f_in);
+    const int64_t c_ok = zxc_stream_compress(f_in, f_arc, &copts);
+    rewind(f_arc);
+    const int64_t d_pipe = zxc_stream_decompress(f_arc, f_pipe_d, &dopts);
+
+    fclose(f_in);
+    fclose(f_arc);
+    fclose(f_pipe_c);
+    fclose(f_pipe_d);
+    signal(SIGPIPE, prev_sigpipe);
+
+    if (c_pipe != ZXC_ERROR_IO || c_ok <= 0 || d_pipe != ZXC_ERROR_IO) {
+        printf(
+            "Failed: compress->pipe %lld, compress->tmpfile %lld, "
+            "decompress->pipe %lld (expected %d, >0, %d)\n",
+            (long long)c_pipe, (long long)c_ok, (long long)d_pipe, ZXC_ERROR_IO, ZXC_ERROR_IO);
+        return 0;
+    }
+    printf("PASS\n\n");
+#else
+    printf("  [SKIP] needs POSIX pipes\n\n");
+#endif
     return 1;
 }
 
