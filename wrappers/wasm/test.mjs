@@ -960,6 +960,196 @@ async function main() {
     );
   }
 
+  // --- Allocation failure ---
+  // Built with ALLOW_MEMORY_GROWTH, malloc returns 0 when the heap is
+  // exhausted. Make the wrapper's Nth malloc fail, for every N an entry
+  // point reaches, and check that it throws without writing through the
+  // null pointer (bytes [0, 1024) sit below the static data) or leaking
+  // the allocations it already made.
+  {
+    console.log("\n-- Allocation failure: throws, no low-memory write, no leak --");
+    const { default: createZXC } = await import("./zxc_wasm.js");
+    const fault = { failAt: 0, calls: 0, hit: false, live: new Set() };
+    let M = null;
+    const faultyFactory = async (overrides) => {
+      M = await ZXCModule(overrides);
+      const realMalloc = M._malloc;
+      const realFree = M._free;
+      M._malloc = (n) => {
+        if (fault.failAt && ++fault.calls === fault.failAt) {
+          fault.hit = true;
+          return 0;
+        }
+        const p = realMalloc(n);
+        if (p) fault.live.add(p);
+        return p;
+      };
+      M._free = (p) => {
+        fault.live.delete(p);
+        realFree(p);
+      };
+      return M;
+    };
+    const zxc = await createZXC({}, faultyFactory);
+
+    // Non-zero bytes, so a copy to address 0 would show up.
+    const payload = new Uint8Array(8192);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i % 251) + 1;
+    const samples = [];
+    for (let k = 0; k < 16; k++) {
+      samples.push(
+        new TextEncoder().encode(
+          `{"id":${k},"type":"event","payload":{"user":"alice","region":"eu-west"}}`,
+        ),
+      );
+    }
+    const dict = zxc.trainDict(samples);
+    const huf = zxc.trainDictHuf(samples, dict);
+    const zxd = zxc.dictSave(dict, huf);
+    const arc = zxc.compress(payload);
+    const arcDict = zxc.compress(payload, { dict, dictHuf: huf });
+    const arcSeek = zxc.compress(payload, { seekable: true });
+    const arcSeekDict = zxc.compress(payload, {
+      seekable: true,
+      dict,
+      dictHuf: huf,
+    });
+
+    const ops = {
+      compress: () => zxc.compress(payload),
+      "compress+dict": () => zxc.compress(payload, { dict, dictHuf: huf }),
+      decompress: () => zxc.decompress(arc),
+      "decompress+dict": () => zxc.decompress(arcDict, { dict, dictHuf: huf }),
+      getDecompressedSize: () => zxc.getDecompressedSize(arc),
+      "cctx.compress": () => {
+        const c = zxc.createCompressContext({ dict, dictHuf: huf });
+        try {
+          c.compress(payload);
+        } finally {
+          c.free();
+        }
+      },
+      "dctx.decompress": () => {
+        const d = zxc.createDecompressContext({ dict, dictHuf: huf });
+        try {
+          d.decompress(arcDict);
+        } finally {
+          d.free();
+        }
+      },
+      cstream: () => {
+        const s = zxc.createCStream();
+        try {
+          s.compress(payload);
+          s.end();
+        } finally {
+          s.free();
+        }
+      },
+      dstream: () => {
+        const s = zxc.createDStream();
+        try {
+          s.decompress(arc);
+        } finally {
+          s.free();
+        }
+      },
+      "seekable.decompressRange": () => {
+        const s = zxc.createSeekable(arcSeek);
+        try {
+          s.decompressRange(0, 512);
+        } finally {
+          s.free();
+        }
+      },
+      "seekable.setDict": () => {
+        const s = zxc.createSeekable(arcSeekDict);
+        try {
+          s.setDict(dict, huf);
+          s.decompressRange(0, 512);
+        } finally {
+          s.free();
+        }
+      },
+      writeSeekTable: () => zxc.writeSeekTable([100, 200, 300]),
+      trainDict: () => zxc.trainDict(samples),
+      trainDictHuf: () => zxc.trainDictHuf(samples, dict),
+      dictTrain: () => zxc.dictTrain(samples),
+      dictSave: () => zxc.dictSave(dict, huf),
+      dictLoad: () => zxc.dictLoad(zxd),
+      dictHuf: () => zxc.dictHuf(zxd),
+      dictId: () => zxc.dictId(dict),
+      getDictId: () => zxc.getDictId(arcDict),
+      dictGetId: () => zxc.dictGetId(zxd),
+    };
+
+    for (const [name, op] of Object.entries(ops)) {
+      const problems = [];
+      let exercised = 0;
+      for (let k = 1; ; k++) {
+        const liveBefore = new Set(fault.live);
+        const lowBefore = M.HEAPU8.slice(0, 1024);
+        fault.failAt = k;
+        fault.calls = 0;
+        fault.hit = false;
+        let err = null;
+        try {
+          op();
+        } catch (e) {
+          err = e;
+        }
+        fault.failAt = 0;
+
+        if (!fault.hit) {
+          // k is past the last allocation: the call must now succeed.
+          if (err) problems.push(`unfaulted run threw: ${err.message}`);
+          break;
+        }
+        exercised++;
+        if (!err || !String(err.message).includes("out of WASM memory")) {
+          problems.push(
+            `malloc #${k}: ${err ? `wrong error "${err.message}"` : "no error"}`,
+          );
+        }
+        const low = M.HEAPU8.subarray(0, 1024);
+        if (!low.every((b, i) => b === lowBefore[i])) {
+          problems.push(`malloc #${k}: wrote through the null pointer`);
+        }
+        const leaked = [...fault.live].filter((p) => !liveBefore.has(p));
+        if (leaked.length > 0) {
+          problems.push(`malloc #${k}: leaked ${leaked.length} allocation(s)`);
+        }
+      }
+      assert(
+        exercised > 0 && problems.length === 0,
+        `${name}: ${exercised} failure point(s) handled` +
+          (problems.length ? ` -- ${problems.join("; ")}` : ""),
+      );
+    }
+
+    const back = zxc.decompress(zxc.compress(payload));
+    assert(arraysEqual(back, payload), "roundtrip still works after the faults");
+  }
+
+  // --- Oversized allocation ---
+  // malloc takes a uint32: a size past the wasm32 heap must be refused, not
+  // wrapped to a small request that the copy then overruns.
+  {
+    const { default: createZXC } = await import("./zxc_wasm.js");
+    const zxc = await createZXC({}, ZXCModule);
+    const huge = { length: 0x100000010 }; // 4 GiB + 16: wraps to 16
+    let msg = "";
+    try {
+      zxc.getDecompressedSize(huge);
+    } catch (e) {
+      msg = String(e.message);
+    }
+    assert(
+      msg.includes("exceeds wasm32 addressable memory"),
+      `size past 2 GiB refused before malloc (got "${msg}")`,
+    );
+  }
+
   // --- Summary ---
   console.log(`\n${"=".repeat(40)}`);
   console.log(`Results: ${passed} passed, ${failed} failed`);
