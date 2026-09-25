@@ -33,60 +33,6 @@
 #include "../../include/zxc_error.h"
 #include "zxc_internal.h"
 
-/**
- * @brief Reads a Prefix Varint encoded integer.
- *
- * Unary prefix bits in the first byte give the total length, at most 3 bytes
- * here since that covers every length this decoder can meet:
- *
- * Format:
- * - 1 byte  (0xxxxxxx):  7-bit payload (val < 2^7  = 128)
- * - 2 bytes (10xxxxxx): 14-bit payload (val < 2^14 = 16384)
- * - 3 bytes (110xxxxx): 21-bit payload (val < 2^21 = 2097152)
- *
- * @param[in,out] ptr Pointer to a pointer to the current position in the stream.
- * @param[in] end Pointer to the end of the readable stream (for bounds checking).
- * @return The decoded 32-bit integer, or 0 if reading would overflow bounds (safe default).
- */
-static ZXC_ALWAYS_INLINE uint32_t zxc_read_varint(const uint8_t** ptr, const uint8_t* end) {
-    const uint8_t* p = *ptr;
-    if (UNLIKELY(p >= end)) return 0;
-
-    const uint32_t b0 = p[0];
-
-    // 1 Byte: 0xxxxxxx (7 bits) -> val < 128 (2^7)
-    if (LIKELY(b0 < 0x80)) {
-        *ptr = p + 1;
-        return b0;
-    }
-
-    // 2 Bytes: 10xxxxxx xxxxxxxx (14 bits) -> val < 16384 (2^14)
-    if (LIKELY(b0 < 0xC0)) {
-        if (UNLIKELY(p + 1 >= end)) {
-            *ptr = end;
-            return 0;
-        }
-        *ptr = p + 2;
-        return (b0 & 0x3F) | ((uint32_t)p[1] << 6);
-    }
-
-    // 3 Bytes: 110xxxxx xxxxxxxx xxxxxxxx (21 bits) -> val < 2^21. The longest
-    // a legitimate varint can be: values are (ll - MASK) or (ml - MASK), always
-    // strictly below block_size_max = 2^21.
-    if (LIKELY(b0 < 0xE0)) {
-        if (UNLIKELY(p + 2 >= end)) {
-            *ptr = end;
-            return 0;
-        }
-        *ptr = p + 3;
-        return (b0 & 0x1F) | ((uint32_t)p[1] << 5) | ((uint32_t)p[2] << 13);
-    }
-
-    // extra encoding: out-of-spec for the current format, reject.
-    *ptr = end;
-    return 0;
-}
-
 #if defined(ZXC_USE_NEON64) || defined(ZXC_USE_NEON32) || defined(ZXC_USE_AVX2) || \
     defined(ZXC_USE_AVX512)
 /**
@@ -789,8 +735,7 @@ static ZXC_NOINLINE ZXC_COLD int zxc_decode_lit_pivco_dict(const zxc_cctx_t* RES
                  ctx->pivco_scratch_cap < required_size + ZXC_PIVCO_SCRATCH_PAD))
         return ZXC_ERROR_DST_TOO_SMALL;
     return zxc_huf_decode_section_dict(payload, psize, ctx->lit_buffer, required_size,
-                                       &ctx->dict_huf->tree, &ctx->dict_huf->dec,
-                                       ctx->pivco_scratch);
+                                       &ctx->dict_huf->tree, ctx->pivco_scratch);
 }
 
 static ZXC_NOINLINE ZXC_COLD int zxc_decode_tok_pivco(const zxc_cctx_t* RESTRICT ctx,
@@ -1628,8 +1573,8 @@ static ZXC_NOINLINE int zxc_decode_block_ghi_safe(const zxc_cctx_t* RESTRICT ctx
 #undef DECODE_MATCH_SAFE
 
 /**
- * @brief Shared chunk-decode body: validates the block header, verifies the
- *        optional checksum, then dispatches on block type.
+ * @brief Shared chunk-decode body: validates the header, decodes, then verifies the
+ *        optional checksum.
  *
  * @p has_dict and @p safe are compile-time constants: the no-dict instantiation
  * folds the GLO/GHI selection to the plain (inlinable) decoders, so
@@ -1642,13 +1587,15 @@ static ZXC_NOINLINE int zxc_decode_block_ghi_safe(const zxc_cctx_t* RESTRICT ctx
  * @param[in]     src_sz    Size of @p src in bytes.
  * @param[out]    dst       Destination buffer for the decoded block.
  * @param[in]     dst_cap   Capacity of @p dst in bytes.
+ * @param[in]     block_index Frame position of the block: the checksum seed.
  * @param[in]     has_dict  Compile-time flag: 1 = dictionary-aware decoders.
  * @param[in]     safe      Compile-time flag: 1 = strict-tail safe decoders.
  * @return Bytes written on success, or a negative @ref zxc_error_t.
  */
 static ZXC_ALWAYS_INLINE int zxc_decompress_chunk_wrapper_body(
     const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src, const size_t src_sz,
-    uint8_t* RESTRICT dst, const size_t dst_cap, const int has_dict, const int safe) {
+    uint8_t* RESTRICT dst, const size_t dst_cap, const uint64_t block_index, const int has_dict,
+    const int safe) {
     if (UNLIKELY(src_sz < ZXC_BLOCK_HEADER_SIZE)) return ZXC_ERROR_SRC_TOO_SMALL;
 
     const uint8_t type = src[0];
@@ -1664,12 +1611,6 @@ static ZXC_ALWAYS_INLINE int zxc_decompress_chunk_wrapper_body(
     if (UNLIKELY(src_sz < expected_sz)) return ZXC_ERROR_SRC_TOO_SMALL;
 
     const uint8_t* data = src + ZXC_BLOCK_HEADER_SIZE;
-
-    if (has_checksum) {
-        const uint32_t stored = zxc_le32(data + comp_sz);
-        const uint32_t calc = zxc_checksum(data, comp_sz, 0, ZXC_CHECKSUM_RAPIDHASH);
-        if (UNLIKELY(stored != calc)) return ZXC_ERROR_BAD_CHECKSUM;
-    }
 
     int decoded_sz = ZXC_ERROR_BAD_BLOCK_TYPE;
 
@@ -1697,6 +1638,13 @@ static ZXC_ALWAYS_INLINE int zxc_decompress_chunk_wrapper_body(
             return ZXC_ERROR_BAD_BLOCK_TYPE;
     }
 
+    if (has_checksum && LIKELY(decoded_sz >= 0)) {
+        const uint32_t stored = zxc_le32(data + comp_sz);
+        if (UNLIKELY(stored !=
+                     zxc_checksum(dst, (size_t)decoded_sz, block_index, ZXC_CHECKSUM_RAPIDHASH)))
+            return ZXC_ERROR_BAD_CHECKSUM;
+    }
+
     return decoded_sz;
 }
 
@@ -1708,8 +1656,9 @@ static ZXC_ALWAYS_INLINE int zxc_decompress_chunk_wrapper_body(
  */
 // cppcheck-suppress unusedFunction
 int zxc_decompress_chunk_wrapper(const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
-                                 const size_t src_sz, uint8_t* RESTRICT dst, const size_t dst_cap) {
-    return zxc_decompress_chunk_wrapper_body(ctx, src, src_sz, dst, dst_cap, 0, 0);
+                                 const size_t src_sz, uint8_t* RESTRICT dst, const size_t dst_cap,
+                                 const uint64_t block_index) {
+    return zxc_decompress_chunk_wrapper_body(ctx, src, src_sz, dst, dst_cap, block_index, 0, 0);
 }
 
 /**
@@ -1724,13 +1673,14 @@ int zxc_decompress_chunk_wrapper(const zxc_cctx_t* RESTRICT ctx, const uint8_t* 
  * @param[in]     src_sz  Size of @p src in bytes.
  * @param[out]    dst     Destination buffer for the decoded block.
  * @param[in]     dst_cap Capacity of @p dst in bytes.
+ * @param[in]     block_index Frame position of the block: the checksum seed.
  * @return Bytes written on success, or a negative @ref zxc_error_t.
  */
 // cppcheck-suppress unusedFunction
 int zxc_decompress_chunk_wrapper_dict(const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
                                       const size_t src_sz, uint8_t* RESTRICT dst,
-                                      const size_t dst_cap) {
-    return zxc_decompress_chunk_wrapper_body(ctx, src, src_sz, dst, dst_cap, 1, 0);
+                                      const size_t dst_cap, const uint64_t block_index) {
+    return zxc_decompress_chunk_wrapper_body(ctx, src, src_sz, dst, dst_cap, block_index, 1, 0);
 }
 
 /**
@@ -1746,11 +1696,12 @@ int zxc_decompress_chunk_wrapper_dict(const zxc_cctx_t* RESTRICT ctx, const uint
  * @param[in]     src_sz  Size of @p src in bytes.
  * @param[out]    dst     Destination buffer (capacity == exact decoded size).
  * @param[in]     dst_cap Capacity of @p dst in bytes.
+ * @param[in]     block_index Frame position of the block: the checksum seed.
  * @return Bytes written on success, or a negative @ref zxc_error_t.
  */
 // cppcheck-suppress unusedFunction
 int zxc_decompress_chunk_wrapper_safe(const zxc_cctx_t* RESTRICT ctx, const uint8_t* RESTRICT src,
                                       const size_t src_sz, uint8_t* RESTRICT dst,
-                                      const size_t dst_cap) {
-    return zxc_decompress_chunk_wrapper_body(ctx, src, src_sz, dst, dst_cap, 0, 1);
+                                      const size_t dst_cap, const uint64_t block_index) {
+    return zxc_decompress_chunk_wrapper_body(ctx, src, src_sz, dst, dst_cap, block_index, 0, 1);
 }

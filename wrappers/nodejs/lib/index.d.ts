@@ -32,7 +32,7 @@ export const ERROR_BAD_MAGIC: number;
 export const ERROR_BAD_VERSION: number;
 /** Corrupted or invalid header (checksum mismatch). */
 export const ERROR_BAD_HEADER: number;
-/** Block or global checksum verification failed. */
+/** A block's decoded bytes fail its checksum, or the archive digest mismatches. */
 export const ERROR_BAD_CHECKSUM: number;
 /** Corrupted compressed data. */
 export const ERROR_CORRUPT_DATA: number;
@@ -220,7 +220,7 @@ export function libraryVersion(): string;
 export interface CStreamOptions {
   /** Compression level (1-7). Defaults to LEVEL_DEFAULT. */
   level?: number;
-  /** Enable per-block and global checksums. Defaults to false. */
+  /** Append a per-block checksum and the archive digest. Defaults to false. */
   checksum?: boolean;
   /** Block size in bytes (0 = default 512 KB). Power of 2, 4 KB – 2 MB. */
   blockSize?: number;
@@ -280,7 +280,7 @@ export class CStream {
 }
 
 export interface DStreamOptions {
-  /** Verify per-block and global checksums when present. Defaults to false. */
+  /** Verify the block checksums and archive digest when present. Defaults to false. */
   checksum?: boolean;
 }
 
@@ -386,13 +386,16 @@ export class Seekable {
   decompressedSize(): number;
   /**
    * On-disk compressed size of a specific block (block header +
-   * payload + optional per-block checksum). Returns `null` if
-   * `blockIdx` is out of range.
+   * payload + optional per-block checksum), read from its seek table
+   * group and checked against bounds only. Returns `null` if `blockIdx` is
+   * out of range; throws if the group is unreadable or invalid, or a
+   * `RangeError` if `blockIdx` is not an integer in `[0, 2**53)`.
    */
   blockCompressedSize(blockIdx: number): number | null;
   /**
    * Decompressed size of a specific block, or `null` if `blockIdx` is
-   * out of range.
+   * out of range. Throws a `RangeError` if `blockIdx` is not an integer
+   * in `[0, 2**53)`.
    */
   blockDecompressedSize(blockIdx: number): number | null;
   /**
@@ -421,6 +424,7 @@ export class Seekable {
 /**
  * Encoded byte size of a seek table covering `numBlocks` data blocks.
  * Use this to size a destination buffer for {@link writeSeekTable}.
+ * `numBlocks` must be an integer in `[0, 2**53)`.
  */
 export function seekTableSize(numBlocks: number): number;
 

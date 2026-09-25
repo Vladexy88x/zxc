@@ -8,8 +8,11 @@
 #include <napi.h>
 
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -944,6 +947,25 @@ static Napi::Value ErrorName(const Napi::CallbackInfo& info) {
 // =============================================================================
 // Seekable API: random-access decompression (single-threaded)
 // =============================================================================
+
+// Number.MAX_SAFE_INTEGER
+static constexpr double kMaxSafeInteger =
+    static_cast<double>((uint64_t{1} << std::numeric_limits<double>::digits) - 1);
+
+// Reads a 64-bit block count or index from a JS number. Those are doubles, so a
+// value above kMaxSafeInteger would arrive already rounded.
+static bool ExactUint64FromJs(Napi::Env env, Napi::Value v, const char* what, uint64_t* out) {
+    const double d = v.As<Napi::Number>().DoubleValue();
+    // Rejects NaN too: every comparison against it is false.
+    if (!(d >= 0.0) || !(d <= kMaxSafeInteger) || d != std::trunc(d)) {
+        std::string msg = std::string(what) + " must be an integer in [0, 2^53)";
+        Napi::RangeError::New(env, msg).ThrowAsJavaScriptException();
+        return false;
+    }
+    *out = static_cast<uint64_t>(d);
+    return true;
+}
+
 class SeekableWrap : public Napi::ObjectWrap<SeekableWrap> {
    public:
     static Napi::Function GetClass(Napi::Env env) {
@@ -1036,9 +1058,10 @@ class SeekableWrap : public Napi::ObjectWrap<SeekableWrap> {
     // reader mode.
     Napi::FunctionReference read_at_ref_;
     Napi::Env env_{nullptr};
-    // True while a native call that may re-enter JS (via ReadAtTrampoline) is
-    // on the stack: close(), setDict() and decompressRange() from readAt would
-    // free or corrupt what it uses.
+    // True while a native call that may re-enter JS (via ReadAtTrampoline)
+    // is on the stack. Guards close(), setDict(), decompressRange() and
+    // blockCompressedSize() against reentrant calls from the readAt callback,
+    // which would free or corrupt the handle the C library is still using.
     bool in_native_call_ = false;
 
     // C trampoline invoked by the library for every positional read against
@@ -1078,7 +1101,8 @@ class SeekableWrap : public Napi::ObjectWrap<SeekableWrap> {
 
     Napi::Value NumBlocks(const Napi::CallbackInfo& info) {
         if (!requireOpen(info.Env())) return info.Env().Undefined();
-        return Napi::Number::New(info.Env(), zxc_seekable_get_num_blocks(s_));
+        const uint64_t n = zxc_seekable_get_num_blocks(s_);
+        return Napi::Number::New(info.Env(), static_cast<double>(n));
     }
 
     Napi::Value DecompressedSize(const Napi::CallbackInfo& info) {
@@ -1094,9 +1118,27 @@ class SeekableWrap : public Napi::ObjectWrap<SeekableWrap> {
             Napi::TypeError::New(env, "Expected a block index").ThrowAsJavaScriptException();
             return env.Undefined();
         }
-        uint32_t idx = info[0].As<Napi::Number>().Uint32Value();
+        uint64_t idx = 0;
+        if (!ExactUint64FromJs(env, info[0], "block index", &idx)) return env.Undefined();
         if (idx >= zxc_seekable_get_num_blocks(s_)) return env.Null();
-        return Napi::Number::New(env, zxc_seekable_get_block_comp_size(s_, idx));
+        // The group is read through readAt, so this re-enters JS just as
+        // decompressRange does and needs the same guard: a close() from the
+        // callback must not free the handle the library is still using.
+        if (in_native_call_) {
+            Napi::Error::New(env, "reentrant blockCompressedSize from readAt callback")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        in_native_call_ = true;
+        const uint32_t sz = zxc_seekable_get_block_comp_size(s_, idx);
+        in_native_call_ = false;
+        if (sz == 0) {
+            // 0 is never a real size: the group could not be read or is invalid.
+            Napi::Error::New(env, "seek table group unreadable or invalid")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        return Napi::Number::New(env, sz);
     }
 
     Napi::Value BlockDecompressedSize(const Napi::CallbackInfo& info) {
@@ -1106,7 +1148,8 @@ class SeekableWrap : public Napi::ObjectWrap<SeekableWrap> {
             Napi::TypeError::New(env, "Expected a block index").ThrowAsJavaScriptException();
             return env.Undefined();
         }
-        uint32_t idx = info[0].As<Napi::Number>().Uint32Value();
+        uint64_t idx = 0;
+        if (!ExactUint64FromJs(env, info[0], "block index", &idx)) return env.Undefined();
         if (idx >= zxc_seekable_get_num_blocks(s_)) return env.Null();
         return Napi::Number::New(env, zxc_seekable_get_block_decomp_size(s_, idx));
     }
@@ -1164,6 +1207,7 @@ class SeekableWrap : public Napi::ObjectWrap<SeekableWrap> {
         Napi::Env env = info.Env();
         if (!requireOpen(env)) return env.Undefined();
         if (in_native_call_) {
+            // The running call decodes with the dictionary this would free.
             Napi::Error::New(env, "cannot setDict from inside its readAt callback")
                 .ThrowAsJavaScriptException();
             return env.Undefined();
@@ -1213,7 +1257,8 @@ static Napi::Value SeekTableSize(const Napi::CallbackInfo& info) {
         Napi::TypeError::New(env, "Expected a number (numBlocks)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    uint32_t n = info[0].As<Napi::Number>().Uint32Value();
+    uint64_t n = 0;
+    if (!ExactUint64FromJs(env, info[0], "numBlocks", &n)) return env.Undefined();
     return Napi::Number::New(env, static_cast<double>(zxc_seek_table_size(n)));
 }
 

@@ -119,8 +119,10 @@ impl Seekable {
     /// when the handle is dropped.
     ///
     /// `read_at` is invoked exactly three times during this call (file
-    /// header, footer, seek table), then once per block during subsequent
-    /// [`Seekable::decompress_range`] calls.
+    /// header, footer, EOF/SEK block headers), then by each
+    /// [`Seekable::decompress_range`] once per seek table group the range
+    /// covers and once per block; [`Seekable::block_compressed_size`] reads
+    /// the block's group per call.
     ///
     /// # Errors
     ///
@@ -164,7 +166,9 @@ impl Seekable {
     }
 
     /// Total number of data blocks (excludes the EOF marker block).
-    pub fn num_blocks(&self) -> u32 {
+    ///
+    /// Derived from the footer, never stored, so only the archive size bounds it.
+    pub fn num_blocks(&self) -> u64 {
         unsafe { zxc_sys::zxc_seekable_get_num_blocks(self.inner.as_ptr()) }
     }
 
@@ -174,22 +178,29 @@ impl Seekable {
     }
 
     /// On-disk compressed size of a specific block (block header +
-    /// payload + optional per-block checksum).
+    /// payload + optional per-block checksum), read from its seek table
+    /// group and checked against bounds only.
     ///
-    /// Returns `None` if `block_idx` is out of range.
-    pub fn block_compressed_size(&self, block_idx: u32) -> Option<u32> {
+    /// Returns `Ok(None)` if `block_idx` is out of range, and
+    /// [`Error::InvalidData`] if the group is unreadable or invalid.
+    pub fn block_compressed_size(&self, block_idx: u64) -> Result<Option<u32>> {
         if block_idx >= self.num_blocks() {
-            return None;
+            return Ok(None);
         }
         let sz =
             unsafe { zxc_sys::zxc_seekable_get_block_comp_size(self.inner.as_ptr(), block_idx) };
-        Some(sz)
+        // 0 is never a real size: the group is unreadable or invalid.
+        if sz == 0 {
+            Err(Error::InvalidData)
+        } else {
+            Ok(Some(sz))
+        }
     }
 
     /// Decompressed size of a specific block.
     ///
     /// Returns `None` if `block_idx` is out of range.
-    pub fn block_decompressed_size(&self, block_idx: u32) -> Option<u32> {
+    pub fn block_decompressed_size(&self, block_idx: u64) -> Option<u32> {
         if block_idx >= self.num_blocks() {
             return None;
         }
@@ -347,10 +358,11 @@ unsafe extern "C" fn reader_trampoline(
     result.unwrap_or(zxc_sys::ZXC_ERROR_IO as i64)
 }
 
-/// Encoded byte size of a seek table covering `num_blocks` data blocks.
+/// Encoded byte size of a seek table covering `num_blocks` data blocks,
+/// or 0 when that size does not fit a `usize`.
 ///
 /// Use this to size a destination buffer for [`write_seek_table`].
-pub fn seek_table_size(num_blocks: u32) -> usize {
+pub fn seek_table_size(num_blocks: u64) -> usize {
     unsafe { zxc_sys::zxc_seek_table_size(num_blocks) }
 }
 
@@ -366,7 +378,7 @@ pub fn write_seek_table(dst: &mut [u8], comp_sizes: &[u32]) -> Result<usize> {
             dst.as_mut_ptr(),
             dst.len(),
             comp_sizes.as_ptr(),
-            comp_sizes.len() as u32,
+            comp_sizes.len() as u64,
         )
     };
     if res < 0 {
@@ -449,9 +461,9 @@ mod tests {
         assert!(s.num_blocks() >= 1);
 
         // Block accessors must round-trip on the first block.
-        assert!(s.block_compressed_size(0).unwrap() > 0);
+        assert!(s.block_compressed_size(0).unwrap().unwrap() > 0);
         assert!(s.block_decompressed_size(0).unwrap() > 0);
-        assert!(s.block_compressed_size(s.num_blocks()).is_none());
+        assert!(s.block_compressed_size(s.num_blocks()).unwrap().is_none());
 
         // Full-range decompression.
         let mut out = vec![0u8; payload.len()];
@@ -476,6 +488,28 @@ mod tests {
             .expect("decompress_range failed");
         assert_eq!(n, len);
         assert_eq!(out, payload[start..start + len]);
+    }
+
+    #[test]
+    fn forged_group_is_an_error_not_out_of_range() {
+        let payload: Vec<u8> = (0..32_768).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let mut arc = build_archive(&payload);
+        let n = Seekable::from_bytes(arc.clone())
+            .expect("open failed")
+            .num_blocks() as usize;
+        // Group 0's anchor opens the table, before the 16-byte footer (size, digest).
+        let table = n.div_ceil(64) * 8 + n * 4;
+        let anchor = arc.len() - 16 - table;
+        assert_eq!(arc[anchor], 16, "not group 0's anchor");
+        arc[anchor] ^= 0xFF;
+
+        // Groups are checked on access, not at open.
+        let s = Seekable::from_bytes(arc).expect("open must not scan the table");
+        assert!(matches!(
+            s.block_compressed_size(0),
+            Err(Error::InvalidData)
+        ));
+        assert!(s.block_compressed_size(s.num_blocks()).unwrap().is_none());
     }
 
     #[test]
@@ -618,7 +652,7 @@ mod tests {
     #[test]
     fn seek_table_size_matches_write() {
         let comp_sizes = [128u32, 256, 200, 4];
-        let expected = seek_table_size(comp_sizes.len() as u32);
+        let expected = seek_table_size(comp_sizes.len() as u64);
         let mut buf = vec![0u8; expected];
         let written = write_seek_table(&mut buf, &comp_sizes).expect("write failed");
         assert_eq!(written, expected);

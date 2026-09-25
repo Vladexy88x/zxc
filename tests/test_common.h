@@ -65,6 +65,7 @@ int test_round_trip(const char* test_name, const uint8_t* input, size_t size, in
 int test_buffer_api(void);
 int test_buffer_api_scratch_buf(void);
 int test_min_dist_policy(void);
+int test_glo_match_split(void);
 int test_buffer_error_codes(void);
 int test_get_decompressed_size(void);
 int test_decompress_inplace(void);
@@ -110,8 +111,12 @@ int test_io_failures(void);
 int test_io_deferred_write_failure(void);
 int test_thread_params(void);
 int test_multithread_roundtrip(void);
+int test_stream_checksum_cross_paths(void);
+int test_stream_size_then_decompress(void);
+int test_stream_footer_looks_like_sek(void);
 int test_stream_get_decompressed_size_errors(void);
 int test_stream_engine_errors(void);
+int test_stream_trailing_bytes(void);
 
 /* Push Streaming API (zxc_pstream.h) */
 int test_pstream_roundtrip_basic(void);
@@ -178,13 +183,18 @@ int test_seekable_open_reader_mt(void);
 int test_seekable_cross_boundary(void);
 int test_seekable_truncated_input(void);
 int test_seekable_corrupted_sek(void);
+int test_seekable_mt_group_boundary(void);
 int test_seekable_forged_table_entry(void);
+int test_seekable_forged_total_size(void);
+int test_seekable_eof_with_payload(void);
+int test_seekable_beyond_old_cap(void);
 int test_seekable_range_out_of_bounds(void);
 int test_seekable_dst_too_small(void);
 int test_seekable_empty_file(void);
 int test_seekable_no_checksum(void);
 int test_seekable_with_checksum(void);
 int test_seekable_corrupted_block_checksum(void);
+int test_seekable_swapped_blocks_caught(void);
 int test_seekable_range_reports_short_reads(void);
 int test_seekable_work_buf_tail_pad(void);
 
@@ -201,9 +211,15 @@ int test_huffman_codec_dict(void);
 int test_huffman_single_symbol_validation(void);
 int test_eof_block_structure(void);
 int test_header_checksum(void);
-int test_global_checksum_order(void);
+int test_swapped_blocks_stream(void);
 int test_forged_block_comp_size(void);
+int test_swapped_blocks_oneshot(void);
+int test_tail_between_eof_and_footer(void);
+int test_seek_flag_contract(void);
+int test_footer_digest(void);
+int test_seek_tail_rule(void);
 int test_chunk_size_code(void);
+int test_header_checksum_single_bit(void);
 
 /* Misc */
 int test_error_name(void);
@@ -237,6 +253,8 @@ int test_dict_ctx_table_without_dict(void);
 int test_dict_oversized_rejected_everywhere(void);
 int test_dict_block_huf_roundtrip(void);
 int test_dict_block_stored_block_size(void);
+int test_dict_id_collision_caught_by_checksum(void);
+int test_dict_checksum_cross_paths(void);
 int test_dict_huf_zxd_roundtrip(void);
 int test_dict_huf_table_roundtrip(void);
 int test_dict_huf_degenerate_corpus(void);

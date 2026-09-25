@@ -37,7 +37,8 @@ typedef struct {
     const char* name; /* file stem, without the .zxc */
     int expected;     /* zxc_error_t the decoder must return */
     const char* dict; /* .zxd to offer, a basename in valid/, or NULL */
-    int via_seekable; /* defect only visible to the seekable reader: open must refuse */
+    int via_seekable; /* defect only visible to the seekable reader: the block's access must refuse
+                       */
     int generated;    /* built by build_invalid(); the rest are static files */
 } invalid_expect_t;
 
@@ -63,24 +64,17 @@ static const invalid_expect_t INVALID_EXPECT[] = {
     {"truncated_mid_block", ZXC_ERROR_SRC_TOO_SMALL, .generated = 1},
     {"zero_length", ZXC_ERROR_SRC_TOO_SMALL},
     {"sek_forged_entry", 0, NULL, 1, .generated = 1},
+    {"sek_flag_no_table", ZXC_ERROR_CORRUPT_DATA, .generated = 1},
+    {"sek_table_no_flag", ZXC_ERROR_CORRUPT_DATA, .generated = 1},
     {"bad_block_header_checksum", ZXC_ERROR_BAD_HEADER, .generated = 1},
     {"bad_footer_size", ZXC_ERROR_CORRUPT_DATA, .generated = 1},
-    {"bad_footer_hash", ZXC_ERROR_BAD_CHECKSUM, .generated = 1},
+    {"bad_footer_digest", ZXC_ERROR_BAD_CHECKSUM, .generated = 1},
     {"glo_forged_offset", ZXC_ERROR_BAD_OFFSET, .generated = 1},
     {"glo_output_overflow", ZXC_ERROR_OVERFLOW, .generated = 1},
     {"varint_too_long", ZXC_ERROR_CORRUPT_DATA, .generated = 1},
     {"dict_id_mismatch", ZXC_ERROR_DICT_MISMATCH, "dict_http.zxd", 0, .generated = 1},
 };
 #define INVALID_EXPECT_COUNT (sizeof INVALID_EXPECT / sizeof INVALID_EXPECT[0])
-
-/* Re-sign the 16-byte file header after patching any of its fields. */
-static void resign_file_header(uint8_t* d) {
-    d[14] = 0;
-    d[15] = 0;
-    const uint16_t sum = zxc_hash16(d);
-    d[14] = (uint8_t)(sum & 0xFFU);
-    d[15] = (uint8_t)(sum >> 8);
-}
 
 /* Re-sign an 8-byte block header at @p b after patching type or comp_size. */
 static void resign_block_header(uint8_t* b) {
@@ -234,13 +228,13 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
     size_t n = b->n_plain;
     const uint8_t* src = b->plain;
     if (!strcmp(name, "bad_block_checksum") || !strcmp(name, "corrupt_payload") ||
-        !strcmp(name, "bad_footer_hash")) {
+        !strcmp(name, "bad_footer_digest")) {
         n = b->n_chk;
         src = b->chk;
     } else if (!strcmp(name, "ghi_forged_offset")) {
         n = b->n_ghi;
         src = b->ghi;
-    } else if (!strcmp(name, "sek_forged_entry")) {
+    } else if (!strcmp(name, "sek_forged_entry") || !strcmp(name, "sek_table_no_flag")) {
         n = b->n_seek;
         src = b->seek;
     }
@@ -259,12 +253,12 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
     /* --- File-header defects (checksum re-signed, except where it IS the defect) */
     if (!strcmp(name, "bad_block_size_field")) {
         d[5] = 31; /* block-size code outside [12,21] */
-        resign_file_header(d);
+        zxc_file_header_sign(d);
     } else if (!strcmp(name, "bad_checksum_algo")) {
         d[6] = (uint8_t)((d[6] & 0xF0U) | 0x0FU); /* checksum algorithm id != 0 */
-        resign_file_header(d);
+        zxc_file_header_sign(d);
     } else if (!strcmp(name, "bad_header_checksum")) {
-        resign_file_header(d);
+        zxc_file_header_sign(d);
         d[14] ^= 0xFFU; /* the checksum itself is the defect: corrupt it last */
     } else if (!strcmp(name, "dict_required")) {
         d[6] |= 0x40U; /* HAS_DICTIONARY with a non-zero id, but none supplied */
@@ -272,7 +266,17 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
         d[8] = 0xBE;
         d[9] = 0xAD;
         d[10] = 0xDE;
-        resign_file_header(d);
+        zxc_file_header_sign(d);
+    } else if (!strcmp(name, "sek_flag_no_table")) {
+        /* Sec 3.1: the flag announces a seek table between EOF and the footer.
+         * Set on an archive that carries none, the tail no longer parses. */
+        d[6] |= ZXC_FILE_FLAG_HAS_SEEK_TABLE;
+        zxc_file_header_sign(d);
+    } else if (!strcmp(name, "sek_table_no_flag")) {
+        /* The mirror case: a real table, but the flag says the footer follows
+         * EOF. Reading the table as a footer must fail, never half-succeed. */
+        d[6] &= (uint8_t)~ZXC_FILE_FLAG_HAS_SEEK_TABLE;
+        zxc_file_header_sign(d);
     } else if (!strcmp(name, "dict_id_mismatch")) {
         /* Same shape, with an id matching no committed .zxd: offered a real
          * dictionary, the decoder must reject the binding rather than decode
@@ -282,7 +286,7 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
         d[8] = 0x56;
         d[9] = 0x34;
         d[10] = 0x12;
-        resign_file_header(d);
+        zxc_file_header_sign(d);
 
         /* --- Block-header defects (checksum re-signed) ---------------------- */
     } else if (!strcmp(name, "bad_block_type")) {
@@ -326,16 +330,16 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
 
         /* --- Seek table (Sec 5.5) ------------------------------------------- */
     } else if (!strcmp(name, "sek_forged_entry")) {
-        /* The seek table is advisory: a sequential decode never reads it, so
-         * this defect only surfaces through the seekable reader, which
-         * validates each entry against the block it claims to describe. */
+        /* Advisory: a sequential decode never reads the table, so this only
+         * surfaces in the seekable reader, when the block is accessed. */
         const size_t eof = find_eof_block(d, len, 0);
         const size_t sek = eof ? eof + ZXC_BLOCK_HEADER_SIZE : 0;
-        if (!sek || sek + ZXC_BLOCK_HEADER_SIZE + 4 > len || d[sek] != ZXC_BLOCK_SEK) {
+        if (!sek || sek + ZXC_BLOCK_HEADER_SIZE + ZXC_SEEK_ANCHOR_SIZE > len ||
+            d[sek] != ZXC_BLOCK_SEK) {
             fprintf(stderr, "  no SEK block found - the seekable base changed shape\n");
             ok = 0;
         } else {
-            d[sek + ZXC_BLOCK_HEADER_SIZE] ^= 0xFFU; /* first entry only */
+            d[sek + ZXC_BLOCK_HEADER_SIZE] ^= 0xFFU; /* group 0's anchor only */
         }
 
         /* --- Checksum defects (checksummed base) ---------------------------- */
@@ -349,7 +353,16 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
             d[at] ^= 0xFFU; /* trailing block checksum */
         }
     } else if (!strcmp(name, "corrupt_payload")) {
-        d[PAY0 + ZXC_GLO_HEADER_BINARY_SIZE + 4] ^= 0xFFU; /* a literal byte */
+        /* A raw literal, past tok_comp when present (Sec 5.2): only the checksum catches it. */
+        const size_t lit = PAY0 + ZXC_GLO_HEADER_BINARY_SIZE +
+                           (d[PAY0 + 9] == ZXC_SECTION_ENCODING_HUFFMAN ? 4U : 0U);
+        if (d[BLK0] != ZXC_BLOCK_GLO || d[PAY0 + 8] != ZXC_SECTION_ENCODING_RAW ||
+            zxc_le32(d + PAY0 + 4) <= 4 || lit + 4 >= len) {
+            fprintf(stderr, "  block 0 is not GLO with raw literals\n");
+            ok = 0;
+        } else {
+            d[lit + 4] ^= 0xFFU; /* a raw literal byte */
+        }
 
         /* --- Truncations ---------------------------------------------------- */
     } else if (!strcmp(name, "truncated_header_only")) {
@@ -362,8 +375,9 @@ static int build_invalid(invalid_bases_t* b, const char* name, uint8_t** out, si
         d[BLK0 + 7] ^= 0xFFU; /* left wrong: the header checksum is the defect */
     } else if (!strcmp(name, "bad_footer_size")) {
         d[len - ZXC_FILE_FOOTER_SIZE] ^= 0xFFU; /* declared source size */
-    } else if (!strcmp(name, "bad_footer_hash")) {
-        d[len - ZXC_FILE_FOOTER_SIZE + 8] ^= 0xFFU; /* rolling global hash */
+    } else if (!strcmp(name, "bad_footer_digest")) {
+        /* Checksummed base: the digest is the footer's last 8 bytes (Sec 8). */
+        d[len - ZXC_FILE_DIGEST_SIZE] ^= 0xFFU;
     } else if (!strcmp(name, "glo_forged_offset")) {
         /* GHI has its own vector. The first sequence has only its literal run
          * behind it, so any large offset reaches before the output start. */

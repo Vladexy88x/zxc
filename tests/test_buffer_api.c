@@ -276,7 +276,7 @@ int test_buffer_error_codes() {
             free(src);
             free(full_dst);
         } else {
-            // EOF header(8) + footer(12) = 20 bytes at the end.
+            // EOF header(8) + footer(8) = 16 bytes at the end.
             // Try with a buffer that's just a few bytes too small.
             const size_t tight = (size_t)full_sz - 5;
             uint8_t* tight_dst = malloc(tight);
@@ -335,6 +335,31 @@ int test_buffer_error_codes() {
     }
     printf("  [PASS] zxc_decompress src too small -> ZXC_ERROR_SRC_TOO_SMALL\n");
 
+    // 10b. Too small for its own footer: a checksummed header needs a 16-byte
+    //      footer, so [header][EOF] alone is short of it. Read from the end
+    //      regardless, the "footer" would be header bytes, and the verdict a
+    //      size mismatch; the walk and the no-destination probe both say short.
+    {
+        uint8_t arc[ZXC_FILE_HEADER_SIZE + ZXC_BLOCK_HEADER_SIZE];
+        const zxc_block_header_t eof = {
+            .block_type = ZXC_BLOCK_EOF, .block_flags = 0, .reserved = 0, .comp_size = 0};
+        if (zxc_write_file_header(arc, ZXC_FILE_HEADER_SIZE, 4096, 1, 0, 0) < 0 ||
+            zxc_write_block_header(arc + ZXC_FILE_HEADER_SIZE, ZXC_BLOCK_HEADER_SIZE, &eof) < 0) {
+            printf("  [FAIL] fixture headers\n");
+            return 0;
+        }
+        uint8_t out[64];
+        zxc_decompress_opts_t o = {.checksum_enabled = 0};
+        const int64_t walk = zxc_decompress(arc, sizeof(arc), out, sizeof(out), &o);
+        const int64_t probe = zxc_decompress(arc, sizeof(arc), NULL, 0, &o);
+        if (walk != ZXC_ERROR_SRC_TOO_SMALL || probe != ZXC_ERROR_SRC_TOO_SMALL) {
+            printf("  [FAIL] short of its footer: walk %lld, probe %lld, want %d\n",
+                   (long long)walk, (long long)probe, ZXC_ERROR_SRC_TOO_SMALL);
+            return 0;
+        }
+    }
+    printf("  [PASS] zxc_decompress short of its 16-byte footer -> ZXC_ERROR_SRC_TOO_SMALL\n");
+
     // 11. Bad file header (invalid magic). The header reader's verdict is
     //     forwarded, so this reports the magic, not a catch-all.
     {
@@ -390,7 +415,7 @@ int test_buffer_error_codes() {
 
     // 13. Truncated at EOF (missing footer)
     {
-        // Find the EOF block: it ends with the footer(12 bytes)
+        // Find the EOF block: it ends with the footer(8 bytes)
         // Truncate so the footer is missing
         const size_t trunc_sz = (size_t)comp_sz - ZXC_FILE_FOOTER_SIZE + 2;  // Cut most of footer
         uint8_t* out = malloc(test_src_sz);
@@ -411,9 +436,10 @@ int test_buffer_error_codes() {
     {
         uint8_t* corrupt = malloc((size_t)comp_sz);
         memcpy(corrupt, comp_buf, (size_t)comp_sz);
-        // Footer is at end: last 12 bytes = [src_size(8)] + [global_hash(4)]
-        // Corrupt the source size field (add 1 to the first byte)
-        const size_t footer_offset = (size_t)comp_sz - ZXC_FILE_FOOTER_SIZE;
+        // Checksummed, so the footer is [src_size(8)][digest(8)]: the last 8 bytes
+        // are the digest. Aimed there, this passed on BAD_CHECKSUM and never
+        // exercised the size mismatch it is named for.
+        const size_t footer_offset = (size_t)comp_sz - ZXC_FILE_FOOTER_SIZE - ZXC_FILE_DIGEST_SIZE;
         corrupt[footer_offset] ^= 0x01;  // Flip a bit in the stored source size
         uint8_t* out = malloc(test_src_sz);
         zxc_decompress_opts_t _do45 = {.checksum_enabled = 1};
@@ -431,17 +457,18 @@ int test_buffer_error_codes() {
     }
     printf("  [PASS] zxc_decompress stored size mismatch -> negative\n");
 
-    // 15. Global checksum failure (corrupt the global hash in footer)
+    // 15. Block checksum failure (corrupt the last block's trailing checksum)
     {
         uint8_t* corrupt = malloc((size_t)comp_sz);
         memcpy(corrupt, comp_buf, (size_t)comp_sz);
-        // Global hash is the last 4 bytes of the file
-        corrupt[comp_sz - 1] ^= 0xFF;
+        // Last byte before the EOF block: the last block's checksum.
+        corrupt[comp_sz - ZXC_FILE_FOOTER_SIZE - ZXC_FILE_DIGEST_SIZE - ZXC_BLOCK_HEADER_SIZE -
+                1] ^= 0xFF;
         uint8_t* out = malloc(test_src_sz);
         zxc_decompress_opts_t _do46 = {.checksum_enabled = 1};
         r = zxc_decompress(corrupt, (size_t)comp_sz, out, test_src_sz, &_do46);
         if (r != ZXC_ERROR_BAD_CHECKSUM) {
-            printf("  [FAIL] bad global checksum: expected %d, got %lld\n", ZXC_ERROR_BAD_CHECKSUM,
+            printf("  [FAIL] bad block checksum: expected %d, got %lld\n", ZXC_ERROR_BAD_CHECKSUM,
                    (long long)r);
             free(corrupt);
             free(out);
@@ -452,7 +479,7 @@ int test_buffer_error_codes() {
         free(corrupt);
         free(out);
     }
-    printf("  [PASS] zxc_decompress global checksum -> ZXC_ERROR_BAD_CHECKSUM\n");
+    printf("  [PASS] zxc_decompress block checksum -> ZXC_ERROR_BAD_CHECKSUM\n");
 
     // 16. dst too small for decompression
     {
@@ -946,82 +973,209 @@ static int inplace_forged_footer(void) {
     return ok;
 }
 
-/* The read/write separation is a difference between the bound and the archive
- * size, and the archive size is attacker-controlled: bytes between the EOF block
- * and the footer are skipped by the frame loop, so a padded archive still
- * decodes while each padding byte slides it closer to the output. */
+/* Padding between the EOF block and the footer is refused: only the SEK block
+ * belongs there (Sec 5.5). The frame loop used to skip it, which accepted hidden
+ * bytes and let each one slide the in-place read/write separation closer to the
+ * output, the archive size being attacker-controlled. The bound is still asserted:
+ * it must stay conservative on a padded input, which the decode then refuses.
+ *
+ * All-RAW is the worst case for the margin; a compressible head then RAW blocks is
+ * the worst for padding: the first RAW block used to start inside the write window,
+ * its memcpy overlapping itself. */
 static int inplace_padded_archive(void) {
     const size_t N = 64 * 1024;
     uint8_t* const orig = (uint8_t*)malloc(N);
-    if (!orig) return 0;
-    gen_random_data(orig, N); /* all-RAW: the worst case for the separation */
-
     const size_t cbound = (size_t)zxc_compress_bound(N);
     uint8_t* const comp = (uint8_t*)malloc(cbound);
-    if (!comp) {
+    if (!orig || !comp) {
         free(orig);
-        return 0;
-    }
-    const zxc_compress_opts_t co = {.level = 1, .block_size = ZXC_BLOCK_SIZE_MIN};
-    const int64_t c = zxc_compress(orig, N, comp, cbound, &co);
-    if (c <= 0) {
-        printf("Failed [padded archive]: compress -> %lld\n", (long long)c);
         free(comp);
-        free(orig);
         return 0;
     }
-    const size_t csz = (size_t)c;
 
     int ok = 1;
-    const size_t pads[] = {1, 4096, 20000, 100000};
-    for (size_t i = 0; i < sizeof(pads) / sizeof(pads[0]); i++) {
-        const size_t pad = pads[i];
-        const size_t c2 = csz + pad;
-        uint8_t* const a = (uint8_t*)malloc(c2);
-        if (!a) {
+    for (int shape = 0; shape < 2 && ok; shape++) {
+        const char* const what = shape ? "mixed" : "all-RAW";
+        gen_random_data(orig, N);
+        if (shape) memset(orig, 0, N / 4);
+
+        const zxc_compress_opts_t co = {.level = 1, .block_size = ZXC_BLOCK_SIZE_MIN};
+        const int64_t c = zxc_compress(orig, N, comp, cbound, &co);
+        if (c <= 0) {
+            printf("Failed [padded %s]: compress -> %lld\n", what, (long long)c);
             ok = 0;
             break;
         }
-        memcpy(a, comp, csz - ZXC_FILE_FOOTER_SIZE);
-        memset(a + csz - ZXC_FILE_FOOTER_SIZE, 0xAA, pad);
-        memcpy(a + csz - ZXC_FILE_FOOTER_SIZE + pad, comp + csz - ZXC_FILE_FOOTER_SIZE,
-               ZXC_FILE_FOOTER_SIZE);
+        const size_t csz = (size_t)c;
 
-        const size_t need = zxc_decompress_inplace_bound(a, c2);
-        if (need < c2) {
-            printf("Failed [padded archive]: pad=%zu bound %zu < archive %zu\n", pad, need, c2);
-            ok = 0;
-        } else {
-            uint8_t* const buf = (uint8_t*)malloc(need);
-            if (buf) {
-                memcpy(buf + need - c2, a, c2);
-                const int64_t d = zxc_decompress_inplace(buf, need, c2, NULL);
-                if (d != (int64_t)N || memcmp(buf, orig, N) != 0) {
-                    printf("Failed [padded archive]: pad=%zu inplace %lld want %zu\n", pad,
-                           (long long)d, N);
-                    ok = 0;
-                }
-                free(buf);
+        const size_t pads[] = {1, 4096, 20000, 100000};
+        for (size_t i = 0; i < sizeof(pads) / sizeof(pads[0]) && ok; i++) {
+            const size_t pad = pads[i];
+            const size_t c2 = csz + pad;
+            uint8_t* const a = (uint8_t*)malloc(c2);
+            if (!a) {
+                ok = 0;
+                break;
             }
-        }
-        free(a);
-    }
+            memcpy(a, comp, csz - ZXC_FILE_FOOTER_SIZE);
+            memset(a + csz - ZXC_FILE_FOOTER_SIZE, 0xAA, pad);
+            memcpy(a + csz - ZXC_FILE_FOOTER_SIZE + pad, comp + csz - ZXC_FILE_FOOTER_SIZE,
+                   ZXC_FILE_FOOTER_SIZE);
 
-    /* The bound an authentic archive gets must not have moved. */
-    const size_t plain = zxc_decompress_inplace_bound(comp, csz);
-    uint8_t* const buf = (uint8_t*)malloc(plain);
-    if (buf) {
-        memcpy(buf + plain - csz, comp, csz);
-        if (zxc_decompress_inplace(buf, plain, csz, NULL) != (int64_t)N) {
-            printf("Failed [padded archive]: unpadded archive regressed\n");
-            ok = 0;
+            const size_t need = zxc_decompress_inplace_bound(a, c2);
+            if (need < c2) {
+                printf("Failed [padded %s]: pad=%zu bound %zu < archive %zu\n", what, pad, need,
+                       c2);
+                ok = 0;
+            } else {
+                uint8_t* const buf = (uint8_t*)malloc(need);
+                if (buf) {
+                    memcpy(buf + need - c2, a, c2);
+                    const int64_t d = zxc_decompress_inplace(buf, need, c2, NULL);
+                    if (d != ZXC_ERROR_CORRUPT_DATA) {
+                        printf("Failed [padded %s]: pad=%zu inplace %lld want %d\n", what, pad,
+                               (long long)d, ZXC_ERROR_CORRUPT_DATA);
+                        ok = 0;
+                    }
+                    free(buf);
+                }
+            }
+            free(a);
         }
-        free(buf);
+
+        /* The bound an authentic archive gets must not have moved. */
+        const size_t plain = zxc_decompress_inplace_bound(comp, csz);
+        uint8_t* const buf = (uint8_t*)malloc(plain);
+        if (buf) {
+            memcpy(buf + plain - csz, comp, csz);
+            if (zxc_decompress_inplace(buf, plain, csz, NULL) != (int64_t)N ||
+                memcmp(buf, orig, N) != 0) {
+                printf("Failed [padded %s]: unpadded archive regressed\n", what);
+                ok = 0;
+            }
+            free(buf);
+        }
     }
 
     free(comp);
     free(orig);
     if (ok) printf("  [PASS] padded archive keeps its read/write separation\n");
+    return ok;
+}
+
+/* The margin counts the seek table exactly when HAS_SEEK_TABLE announces it. A
+ * flag cleared over a table leaves those bytes uncounted, like inserted padding:
+ * the write cursor may then run into input it has not read, and the decode must
+ * refuse the archive, never return it. Mixed data (a compressible head, then
+ * incompressible blocks) is the shape where the uncounted bytes bite. */
+static int inplace_seek_flag_margin(void) {
+    const size_t bs = ZXC_BLOCK_SIZE_MIN;
+    const size_t nb = 256;
+    const size_t n = nb * bs;
+    const size_t cbound = (size_t)zxc_compress_bound(n);
+    uint8_t* const src = (uint8_t*)malloc(n);
+    uint8_t* const plain = (uint8_t*)malloc(cbound);
+    uint8_t* const seek = (uint8_t*)malloc(cbound);
+    int ok = src && plain && seek;
+    if (ok) {
+        gen_random_data(src, n);
+        memset(src, 0, 8 * bs);
+    }
+    for (int cs = 0; cs <= 1 && ok; cs++) {
+        zxc_compress_opts_t co = {.level = 1, .block_size = bs, .checksum_enabled = cs};
+        const int64_t pl = zxc_compress(src, n, plain, cbound, &co);
+        co.seekable = 1;
+        const int64_t sl = zxc_compress(src, n, seek, cbound, &co);
+        const size_t pb = pl > 0 ? zxc_decompress_inplace_bound(plain, (size_t)pl) : 0;
+        const size_t sb = sl > 0 ? zxc_decompress_inplace_bound(seek, (size_t)sl) : 0;
+        const size_t table = ZXC_BLOCK_HEADER_SIZE + (size_t)zxc_seek_table_bytes(nb);
+        if (!pb || sb != pb + table) {
+            printf("Failed [seek flag margin]: cs=%d bounds plain %zu, seekable %zu, want +%zu\n",
+                   cs, pb, sb, table);
+            ok = 0;
+            break;
+        }
+
+        seek[6] &= (uint8_t)~ZXC_FILE_FLAG_HAS_SEEK_TABLE;
+        zxc_file_header_sign(seek);
+        const size_t lb = zxc_decompress_inplace_bound(seek, (size_t)sl);
+        uint8_t* const buf = (uint8_t*)malloc(lb);
+        if (!buf) {
+            ok = 0;
+            break;
+        }
+        memcpy(buf + lb - (size_t)sl, seek, (size_t)sl);
+        const zxc_decompress_opts_t dop = {.checksum_enabled = 1};
+        const int64_t r = zxc_decompress_inplace(buf, lb, (size_t)sl, &dop);
+        free(buf);
+        if (lb != pb || r >= 0) {
+            printf(
+                "Failed [seek flag margin]: cs=%d cleared flag: bound %zu (plain %zu), "
+                "inplace %lld\n",
+                cs, lb, pb, (long long)r);
+            ok = 0;
+        }
+    }
+    free(src);
+    free(plain);
+    free(seek);
+    if (ok) printf("  [PASS] margin counts the seek table only when announced\n");
+    return ok;
+}
+
+/* Blocks shorter than the header's block_size are valid and the bound counts full
+ * ones: 1 MiB in 4 KiB blocks under a 64 KiB header, zero head then noise, must
+ * still decode at its bound. */
+static int inplace_short_blocks(void) {
+    const size_t hdr_bs = 64 * 1024, sub = ZXC_BLOCK_SIZE_MIN, n = 1 << 20;
+    const size_t cap = (size_t)zxc_compress_bound(n);
+    uint8_t* const src = (uint8_t*)malloc(n);
+    uint8_t* const ref = (uint8_t*)malloc(cap);
+    uint8_t* const arc = (uint8_t*)malloc(cap);
+    uint8_t* const out = (uint8_t*)malloc(n);
+    const zxc_compress_opts_t bo = {.level = 3, .block_size = sub};
+    zxc_cctx* const cc = zxc_create_cctx(&bo);
+    int ok = src && ref && arc && out && cc;
+    if (ok) {
+        gen_random_data(src, n);
+        memset(src, 0, 4 * sub);
+        // Header, EOF block and footer from a real archive of the same bytes.
+        const zxc_compress_opts_t ho = {.level = 3, .block_size = hdr_bs};
+        const int64_t rl = zxc_compress(src, n, ref, cap, &ho);
+        ok = rl > 0;
+        size_t pos = ZXC_FILE_HEADER_SIZE;
+        if (ok) memcpy(arc, ref, pos);
+        for (size_t off = 0; ok && off < n; off += sub) {
+            const int64_t w = zxc_compress_block(cc, src + off, sub, arc + pos, cap - pos, &bo);
+            ok = w > 0;
+            pos += ok ? (size_t)w : 0;
+        }
+        if (ok) {
+            const size_t tail = ZXC_BLOCK_HEADER_SIZE + ZXC_FILE_FOOTER_SIZE;
+            memcpy(arc + pos, ref + rl - tail, tail);
+            pos += tail;
+            const int64_t two = zxc_decompress(arc, pos, out, n, NULL);
+            const size_t need = zxc_decompress_inplace_bound(arc, pos);
+            uint8_t* const buf = (uint8_t*)malloc(need);
+            int64_t one = -1;
+            if (buf) {
+                memcpy(buf + need - pos, arc, pos);
+                one = zxc_decompress_inplace(buf, need, pos, NULL);
+            }
+            ok = two == (int64_t)n && memcmp(out, src, n) == 0 && one == (int64_t)n && buf &&
+                 memcmp(buf, src, n) == 0;
+            if (!ok)
+                printf("Failed [short blocks]: two-buffer %lld, in-place at bound %zu: %lld\n",
+                       (long long)two, need, (long long)one);
+            free(buf);
+        }
+    }
+    zxc_free_cctx(cc);
+    free(out);
+    free(arc);
+    free(ref);
+    free(src);
+    if (ok) printf("  [PASS] short blocks under a larger header block size decode in place\n");
     return ok;
 }
 
@@ -1059,6 +1213,12 @@ int test_decompress_inplace(void) {
     ok &= inplace_case("seekable random, 64K blocks", a, M, 1, 0, 64 * 1024, 1);
     ok &= inplace_case("seekable random, default blocks", a, M, 3, 1, 0, 1);
 
+    /* Compressible head, incompressible tail: the separation is tightest where
+     * the first incompressible block starts, for both layouts. */
+    memset(a, 0, M / 8);
+    ok &= inplace_case("mixed, 4K blocks", a, M, 1, 0, ZXC_BLOCK_SIZE_MIN, 0);
+    ok &= inplace_case("mixed seekable, 4K blocks", a, M, 1, 1, ZXC_BLOCK_SIZE_MIN, 1);
+
     /* bound on garbage must be 0. */
     uint8_t junk[64];
     memset(junk, 0x5A, sizeof(junk));
@@ -1069,6 +1229,8 @@ int test_decompress_inplace(void) {
 
     ok &= inplace_forged_footer();
     ok &= inplace_padded_archive();
+    ok &= inplace_seek_flag_margin();
+    ok &= inplace_short_blocks();
 
     free(a);
     if (!ok) return 0;
@@ -1119,6 +1281,7 @@ int test_min_dist_policy(void) {
     // count switches between its floor, the proportional band, and its cap.
     // These pin the verdict across all three regimes; they are far enough from
     // the threshold that they would not catch an off-by-one in that count.
+#if ZXC_LZ_MINDIST > 1
     static const size_t sizes[] = {4096, 16384, 40960, 65536, 256 * 1024};
     for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
         const unsigned long sz = (unsigned long)sizes[k];
@@ -1136,6 +1299,11 @@ int test_min_dist_policy(void) {
         printf("Failed: probe judged a block too small to sample\n");
         goto done;
     }
+#else
+    // Floor off (ZXC_LZ_MINDIST == 1): nothing is "short", so the probe has no
+    // verdict to give; only the round trips below apply.
+    printf("(distance floor off: probe checks skipped)\n");
+#endif
     // Whichever way it goes, the archive stays ordinary at every level.
     for (int lvl = ZXC_LEVEL_FASTEST; lvl <= ZXC_LEVEL_ULTRA; lvl++) {
         if (!test_round_trip("mindist text", text, n, lvl, 0)) goto done;
@@ -1147,5 +1315,52 @@ int test_min_dist_policy(void) {
 done:
     free(text);
     free(per);
+    return ok;
+}
+
+// Round trips through zxc_glo_split_block, where a rewrite regression shows:
+// escaped matches (20-38 bytes) mixed irregularly with inline ones (6-19 bytes),
+// which levels 3-5 split within their caps.
+int test_glo_match_split(void) {
+    printf("=== TEST: Unit - GLO match splitting round trip ===\n");
+    const size_t cap = 512 * 1024;
+    uint8_t* buf = malloc(cap);
+    int ok = 0;
+    if (!buf) goto done;
+
+    uint32_t st = 0x9E3779B9U;
+    uint8_t src[96];  // shared match source; back-references clear the distance floor
+    for (size_t k = 0; k < sizeof(src); k++) {
+        st = st * 1103515245U + 12345U;
+        src[k] = (uint8_t)(st >> 16);
+    }
+    size_t n = 0;
+    for (size_t k = 0; k < sizeof(src) && n < cap; k++) buf[n++] = src[k];
+    while (n + sizeof(src) + 64 < cap) {
+        st = st * 1103515245U + 12345U;
+        const size_t lit = (st >> 16) % 8U;  // 0-7 literals, LL mostly inline
+        for (size_t k = 0; k < lit && n < cap; k++) {
+            st = st * 1103515245U + 12345U;
+            buf[n++] = (uint8_t)(st >> 16);
+        }
+        st = st * 1103515245U + 12345U;
+        // ~1 in 4 matches escapes the ML field (20-38 bytes); the rest stay inline.
+        const size_t m =
+            ((st >> 16) % 4U == 0U) ? 20U + ((st >> 18) % 19U) : 6U + ((st >> 18) % 14U);
+        for (size_t k = 0; k < m && n < cap; k++) buf[n++] = src[k % sizeof(src)];
+    }
+
+    // Levels 3-5 run the split; 1-2 (GHI) and 6-7 must round-trip cleanly too.
+    for (int lvl = ZXC_LEVEL_FASTEST; lvl <= ZXC_LEVEL_ULTRA; lvl++)
+        if (!test_round_trip("glo split", buf, n, lvl, 0)) goto done;
+    // Text-like data reaches the split by a different route (irregular escapes).
+    fill_text_like(buf, cap);
+    for (int lvl = ZXC_LEVEL_DEFAULT; lvl <= ZXC_LEVEL_DENSITY; lvl++)
+        if (!test_round_trip("glo split text", buf, cap, lvl, 0)) goto done;
+
+    printf("PASS\n\n");
+    ok = 1;
+done:
+    free(buf);
     return ok;
 }

@@ -1,7 +1,7 @@
 # ZXC API & ABI Reference
 
 **Library version**: 0.14.1
-**SOVERSION**: 4  
+**SOVERSION**: 5  
 **License**: BSD-3-Clause
 
 This document is the authoritative reference for the public API surface and ABI
@@ -75,6 +75,8 @@ callback. It is opt-in only because most consumers do not need
 random-access decompression; it does not pull `<stdio.h>`. Kernel /
 embedded consumers can include it directly.
 
+Porting to a libc-less target: [contrib/linux-kernel](../contrib/linux-kernel/README.md).
+
 `zxc_stream.h` is the only header that requires `<stdio.h>`. It groups
 every `FILE*`-flavored entry point: the multi-threaded streaming driver
 (`zxc_stream_compress` / `zxc_stream_decompress`) and the seekable
@@ -137,7 +139,7 @@ libzxc.so.{SOVERSION}.{MAJOR}.{MINOR}.{PATCH}
 
 | Field | Description | Current |
 |-------|-------------|---------|
-| `SOVERSION` | Bumped on **ABI-breaking** changes (struct layout, removed symbols, changed signatures). | **4** |
+| `SOVERSION` | Bumped on **ABI-breaking** changes (struct layout, removed symbols, changed signatures). | **5** |
 | `VERSION` | Tracks the library release. | **0.14.1** |
 
 **Compatibility rule**: any binary compiled against SOVERSION N will load against
@@ -147,8 +149,8 @@ any libzxc with the same SOVERSION, regardless of the `VERSION` triple.
 
 | Platform | Files |
 |----------|-------|
-| Linux | `libzxc.so` -> `libzxc.so.4` -> `libzxc.so.0.14.1` |
-| macOS | `libzxc.dylib` -> `libzxc.4.dylib` -> `libzxc.0.14.1.dylib` |
+| Linux | `libzxc.so` -> `libzxc.so.5` -> `libzxc.so.0.14.1` |
+| macOS | `libzxc.dylib` -> `libzxc.5.dylib` -> `libzxc.0.14.1.dylib` |
 | Windows | `zxc.dll` + `zxc.lib` (import) |
 
 ---
@@ -386,7 +388,8 @@ Compresses `src` into `dst`. Only `level`, `block_size`, `checksum_enabled`, and
 `seekable` fields of `opts` are used. `n_threads` is ignored (always single-threaded).
 
 **Returns**: compressed size (> 0) on success, or negative `zxc_error_t`. A
-zero `src_size` (with `src` NULL or not) writes the 36-byte empty archive.
+zero `src_size` (with `src` NULL or not) writes the empty archive: 32 bytes, +8
+with `checksum_enabled`, +8 with `seekable`.
 
 ### `zxc_decompress`
 
@@ -442,8 +445,9 @@ accumulated per-block framing overhead (incompressible blocks make the
 compressed stream run that much longer than the output), everything the encoder
 writes after the last data block, and the wild-copy tail. The trailing bytes
 matter because they sit to the *right* of the read cursor and so push the
-flush-right archive left, into the write cursor's path; no header flag announces
-a seek table, so its worst case (4 bytes per block) is always reserved. Always
+flush-right archive left, into the write cursor's path. The seek table (one `u64`
+anchor per 64 blocks plus a `u32` per block, about 4.1 bytes per block) counts
+only when the header's `HAS_SEEK_TABLE` announces it. Always
 size the buffer with this function rather than re-deriving the formula.
 
 **Returns**: required buffer size, or `0` if `src` is not a valid archive.
@@ -465,7 +469,10 @@ targets (embedded, FOTA, firmware). The compressed archive must sit
 **flush-right** in `buffer` (its last `comp_size` bytes); decoding runs
 left-to-right into `buffer[0..]`. Because ZXC never expands a block, the write
 cursor provably never overtakes the flush-right read cursor once
-`buffer_capacity >= zxc_decompress_inplace_bound(...)`. Dictionary archives are
+`buffer_capacity >= zxc_decompress_inplace_bound(...)`; an archive whose output
+would reach unread input (padding, forged block sizes) is refused with
+`ZXC_ERROR_CORRUPT_DATA` first.
+Dictionary archives are
 supported. An undersized buffer is rejected with `ZXC_ERROR_DST_TOO_SMALL`,
 never corruption.
 
@@ -503,6 +510,8 @@ for filesystem integrations (DwarFS, EROFS, SquashFS) where the caller
 manages its own block indexing.
 
 Output format: `block_header (8 B)` + compressed payload + optional `checksum (4 B)`.
+The checksum covers the block's decompressed bytes, seeded with 0 (frames seed each block with
+its position), so it is verified after decoding.
 
 ### `zxc_compress_block_bound`
 
@@ -647,10 +656,10 @@ Returns an accurate estimate of the peak memory used when compressing a single
 block of `src_size` bytes at the given `level` via `zxc_compress_block()`.
 
 The estimate covers all per-chunk working buffers (chain table, literals,
-sequence/token/offset/extras buffers) plus the fixed hash tables and the
-cache-line alignment padding. At `level >= 6` it also includes the transient
-DP scratch (~18 × `src_size` bytes) malloc'd by the price-based optimal parser
-for the duration of each block. It scales roughly linearly with `src_size` and
+sequence/token/offset/extras buffers), the fixed hash tables and match-split
+histograms, and the cache-line alignment padding. At `level >= 6` it also
+includes the optimal parser's scratch (~8.125 × `src_size`), allocated once and
+reused. It scales roughly linearly with `src_size` and
 is intended for integrators that need to build an accurate memory budget
 (filesystems, embedded devices, sandboxed workloads).
 
@@ -800,7 +809,7 @@ wrapper plus every persistent sub-buffer the library would partition.
 (non-power-of-two `block_size`, out-of-range level, ...).
 
 **Note**: level 6 (`ZXC_LEVEL_DENSITY`) adds the optimal-parser scratch
-(~8.125 × `block_size`); levels 1–5 share the same workspace size.
+(~8.125 × `block_size`, at least ~213 KiB); levels 1–5 share the same workspace size.
 
 ### `zxc_init_static_cctx`
 
@@ -929,7 +938,8 @@ must know it *before* calling `init`. Four patterns cover every use case:
    zxc_seekable* s = zxc_seekable_open_reader(&r);  /* parses SEK table only */
    const uint32_t bs = zxc_seekable_get_block_decomp_size(s, 0);
    /* For multi-block archives, block index 0 is always a full block.
-    * For a single-block archive, bs equals the total decompressed size. */
+    * For a single-block archive, bs equals the total decompressed size.
+    * An empty archive has 0 blocks: bs is 0, nothing to decode. */
    ```
 
 3. **Stream / buffer archive — peek the 16-byte file header.** The block
@@ -1006,7 +1016,8 @@ ZXC_EXPORT int64_t zxc_stream_decompress(
 );
 ```
 
-Decompresses `f_in` -> `f_out` using a parallel pipeline.
+Decompresses `f_in` -> `f_out` using a parallel pipeline. Bytes after the footer
+are `ZXC_ERROR_CORRUPT_DATA`.
 
 **Returns**: total decompressed bytes written, or negative `zxc_error_t`.
 
@@ -1016,9 +1027,13 @@ Decompresses `f_in` -> `f_out` using a parallel pipeline.
 ZXC_EXPORT int64_t zxc_stream_get_decompressed_size(FILE* f_in);
 ```
 
-Reads the original size from the file footer. File position is restored.
+Reads the original size from the file footer, after validating the file header
+as a decoder would and capping the size by what the archive could hold. File
+position is restored.
 
-**Returns**: original size, or negative `zxc_error_t`.
+**Returns**: original size, or negative `zxc_error_t` (the header's verdict,
+`ZXC_ERROR_SRC_TOO_SMALL`, `ZXC_ERROR_CORRUPT_DATA` for an implausible size, or
+an I/O error).
 
 ---
 
@@ -1112,7 +1127,7 @@ ZXC_EXPORT int64_t zxc_cstream_end(zxc_cstream* cs, zxc_outbuf_t* out);
 ```
 
 Finalises the stream: compresses any partial last block, emits the EOF
-block (8 B) and the file footer (12 B).  **Must be called** to produce a
+block (8 B) and the file footer (8 B, 16 with a digest).  **Must be called** to produce a
 valid ZXC file.
 
 Reentrant the same way `_compress` is: loop until it returns `0`.
@@ -1144,10 +1159,10 @@ ZXC_EXPORT zxc_dstream* zxc_dstream_create(const zxc_decompress_opts_t* opts);
 ```
 
 Creates a push decompression context.  Only `checksum_enabled` from `opts`
-is honoured (controls whether the global file-level checksum is verified
-when the file carries one). Dictionary options fail creation, and an archive
-whose header requires a dictionary fails with `ZXC_ERROR_DICT_REQUIRED` at the
-first decompress call.
+is honoured (controls whether the block checksums and archive digest are
+verified when the file carries them). Dictionary options fail creation, and an
+archive whose header requires a dictionary fails with `ZXC_ERROR_DICT_REQUIRED`
+at the first decompress call.
 
 **Returns**: context, or `NULL` on allocation failure.
 
@@ -1275,7 +1290,8 @@ ZXC_EXPORT zxc_seekable* zxc_seekable_open(const void* src, const size_t src_siz
 Opens a seekable archive from a memory buffer.  The buffer must remain
 valid for the lifetime of the handle.
 
-**Returns**: handle on success, or `NULL` if the buffer is not a valid seekable archive.
+**Returns**: handle (0 blocks if the archive is empty), or `NULL` if the buffer is not a valid
+seekable archive.
 
 ### `zxc_seekable_open_file`
 
@@ -1315,8 +1331,8 @@ negative `zxc_error_t` on failure. Short reads are treated as errors.
 
 **Thread safety**: `read_at` MUST be safe to call concurrently from multiple
 threads when the resulting handle is used with
-`zxc_seekable_decompress_range_mt()`. The single-threaded path makes no
-concurrent calls.
+`zxc_seekable_decompress_range_mt()`, or when calls on one handle overlap: all
+of them read through it, `zxc_seekable_get_block_comp_size()` included.
 
 **Lifetime**: `ctx` and the backing storage must remain valid until
 `zxc_seekable_free()`.
@@ -1328,21 +1344,24 @@ ZXC_EXPORT zxc_seekable* zxc_seekable_open_reader(const zxc_reader_t* r);
 ```
 
 Opens a seekable archive through a user-supplied reader. The reader is invoked
-to fetch the file header, footer, and seek table at open time (3 reads), then
-once per block during decompression. No `FILE*` is involved — this is the
-entry point to use for kernel space, networked storage, or any non-POSIX
-backend.
+to fetch the file header, footer, and the EOF/SEK block headers at open time
+(3 reads, whatever the block count), then one read per seek table group a
+range covers and once per block during decompression;
+`zxc_seekable_get_block_comp_size()` reads the block's group per call. No
+`FILE*` is involved — this is the entry point to use for kernel space,
+networked storage, or any non-POSIX backend.
 
-**Returns**: handle on success, or `NULL` if `r`/`r->read_at` is `NULL`,
-`r->size` is `0`, the archive is not seekable, or any `read_at` call fails.
+**Returns**: handle (0 blocks if the archive is empty), or `NULL` if `r`/`r->read_at`
+is `NULL`, `r->size` is `0`, the archive is not seekable, or any `read_at` call fails.
 
 ### `zxc_seekable_get_num_blocks`
 
 ```c
-ZXC_EXPORT uint32_t zxc_seekable_get_num_blocks(const zxc_seekable* s);
+ZXC_EXPORT uint64_t zxc_seekable_get_num_blocks(const zxc_seekable* s);
 ```
 
-Returns the total number of data blocks in the archive.
+Returns the total number of data blocks in the archive. The count is derived
+from the footer, never stored in a field, so only the archive size bounds it.
 
 ### `zxc_seekable_get_decompressed_size`
 
@@ -1357,18 +1376,21 @@ Returns the total decompressed size of the archive.
 ```c
 ZXC_EXPORT uint32_t zxc_seekable_get_block_comp_size(
     const zxc_seekable* s,
-    uint32_t            block_idx
+    uint64_t            block_idx
 );
 ```
 
-Returns the compressed size (on-disk, including header) of a specific block.
+Returns the compressed size (on-disk, including header) of a specific block,
+read from its seek table group, or `0` if `block_idx` is out of range or the
+group is unreadable or invalid. Checked against bounds only: a forged size within
+them comes back as is.
 
 ### `zxc_seekable_get_block_decomp_size`
 
 ```c
 ZXC_EXPORT uint32_t zxc_seekable_get_block_decomp_size(
     const zxc_seekable* s,
-    uint32_t            block_idx
+    uint64_t            block_idx
 );
 ```
 
@@ -1389,6 +1411,10 @@ ZXC_EXPORT int64_t zxc_seekable_decompress_range(
 Decompresses `len` bytes starting at byte `offset` in the original
 uncompressed data.  Only the blocks overlapping the requested range are read
 and decompressed.
+
+The seek table is not authenticated: a forged one can return another block's
+bytes with no error. Only verified checksums (`zxc_seekable_set_checksum`) bind a
+block to its position.
 
 **Returns**: `len` on success, or negative `zxc_error_t`.
 
@@ -1426,7 +1452,7 @@ ZXC_EXPORT int64_t zxc_write_seek_table(
     uint8_t*        dst,
     size_t          dst_capacity,
     const uint32_t* comp_sizes,
-    uint32_t        num_blocks
+    uint64_t        num_blocks
 );
 ```
 
@@ -1437,7 +1463,7 @@ Low-level: writes a seek table (block header + entries) to `dst`.
 ### `zxc_seek_table_size`
 
 ```c
-ZXC_EXPORT size_t zxc_seek_table_size(uint32_t num_blocks);
+ZXC_EXPORT size_t zxc_seek_table_size(uint64_t num_blocks);
 ```
 
 Returns the encoded byte size of a seek table for `num_blocks` blocks.
@@ -1584,7 +1610,9 @@ Turns per-block checksum verification on or off for this handle. **Off by
 default**, as in the one-shot API: random access reads whole blocks and
 verifying them costs a hash over each one, so the caller decides. With it on, a
 block whose checksum does not match returns `ZXC_ERROR_BAD_CHECKSUM`; with it
-off, a corrupted block can decode to wrong bytes with no error.
+off, a corrupted block can decode to wrong bytes with no error. Checksums are
+seeded with each block's position, so verification also catches a block moved by
+a forged seek table.
 
 Does nothing on an archive compressed without checksums. May be called at any
 time and applies from the next call on, on both the single- and multi-threaded

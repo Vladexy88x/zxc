@@ -281,9 +281,10 @@ int test_pstream_empty_input(void) {
         printf("compress NULL/0 failed\n");
         return 0;
     }
-    /* Should at least be: file header (16) + EOF block (8) + footer (12) = 36 bytes. */
-    if (comp_size < 36) {
-        printf("expected >=36 bytes, got %zu\n", comp_size);
+    /* Checksums on: header (16) + EOF block (8) + size and digest (16) = 40.
+     * At 32 a footer missing its digest passed. */
+    if (comp_size < 40) {
+        printf("expected >=40 bytes, got %zu\n", comp_size);
         free(comp);
         return 0;
     }
@@ -509,8 +510,8 @@ int test_pstream_corrupted_magic(void) {
 }
 
 /* Decompress a SEEKABLE archive through the pstream API: after the EOF block
- * the decoder peeks 8 bytes, recognises a SEK block, and skips its payload
- * in DS_DRAIN_SEK_PAYLOAD before consuming the file footer. */
+ * the header's HAS_SEEK_TABLE sends the decoder to the SEK block, whose payload
+ * it skips in DS_DRAIN_SEK_PAYLOAD before consuming the file footer. */
 int test_pstream_decode_seekable_archive(void) {
     printf("=== TEST: PStream decodes seekable archive (DS_DRAIN_SEK_PAYLOAD) ===\n");
     const size_t size = 96 * 1024; /* > one default block to force >1 SEK entry */
