@@ -757,3 +757,156 @@ int test_static_dctx_block_bounds(void) {
     if (ok) printf("PASS\n\n");
     return ok;
 }
+
+/* Round trip, then the documented refusals. */
+static int inplace_dctx_case(zxc_dctx* d, const char* label, const uint8_t* orig, size_t n,
+                             int level, int checksum, size_t block_size) {
+    const size_t cbound = (size_t)zxc_compress_bound(n);
+    uint8_t* const comp = (uint8_t*)malloc(cbound);
+    if (!comp) return 0;
+    const zxc_compress_opts_t co = {
+        .level = level, .checksum_enabled = checksum, .block_size = block_size};
+    const int64_t c = zxc_compress(orig, n, comp, cbound, &co);
+    const size_t need = c > 0 ? zxc_decompress_inplace_bound(comp, (size_t)c) : 0;
+    uint8_t* const buf = need ? (uint8_t*)malloc(need) : NULL;
+    int ok = buf != NULL;
+    const zxc_decompress_opts_t dop = {.checksum_enabled = checksum};
+    const size_t csz = (size_t)c;
+
+    if (ok) {
+        memset(buf, 0xCC, need);
+        memcpy(buf + need - csz, comp, csz); /* flush-right */
+        const int64_t r = zxc_decompress_inplace_dctx(d, buf, need, csz, &dop);
+        if (r != (int64_t)n || memcmp(buf, orig, n) != 0) {
+            printf("  [FAIL] %s: inplace_dctx ret=%lld want=%zu\n", label, (long long)r, n);
+            ok = 0;
+        }
+    }
+    /* One byte short. */
+    if (ok && need - 1 >= csz) {
+        memcpy(buf + need - 1 - csz, comp, csz);
+        const int64_t r = zxc_decompress_inplace_dctx(d, buf, need - 1, csz, &dop);
+        if (r != ZXC_ERROR_DST_TOO_SMALL) {
+            printf("  [FAIL] %s: undersized -> %lld\n", label, (long long)r);
+            ok = 0;
+        }
+    }
+    /* Padding before the footer. */
+    if (ok) {
+        const size_t pad = 4096;
+        const size_t footer = ZXC_FILE_FOOTER_SIZE + (checksum ? ZXC_FILE_DIGEST_SIZE : 0);
+        uint8_t* const bad = (uint8_t*)malloc(csz + pad);
+        size_t bneed = 0;
+        if (bad) {
+            memcpy(bad, comp, csz - footer);
+            memset(bad + csz - footer, 0xA5, pad);
+            memcpy(bad + csz - footer + pad, comp + csz - footer, footer);
+            bneed = zxc_decompress_inplace_bound(bad, csz + pad);
+        }
+        uint8_t* const b2 = bneed ? (uint8_t*)malloc(bneed) : NULL;
+        if (b2) {
+            memcpy(b2 + bneed - csz - pad, bad, csz + pad);
+            const int64_t r = zxc_decompress_inplace_dctx(d, b2, bneed, csz + pad, &dop);
+            if (r != ZXC_ERROR_CORRUPT_DATA) {
+                printf("  [FAIL] %s: padded -> %lld\n", label, (long long)r);
+                ok = 0;
+            }
+        }
+        free(b2);
+        free(bad);
+    }
+    if (ok) printf("  [PASS] %s (n=%zu, comp=%zu, margin=%zu)\n", label, n, csz, need - n);
+    free(buf);
+    free(comp);
+    return ok;
+}
+
+/* Compresses @p n bytes at @p block_size and decodes them in place through @p d. */
+static int64_t inplace_refusal(zxc_dctx* d, const uint8_t* src, size_t n, size_t block_size,
+                               const zxc_decompress_opts_t* dop) {
+    const zxc_compress_opts_t co = {.level = 3, .block_size = block_size};
+    const size_t cb = (size_t)zxc_compress_bound(n);
+    uint8_t* const comp = (uint8_t*)malloc(cb);
+    const int64_t c = comp ? zxc_compress(src, n, comp, cb, &co) : -1;
+    const size_t need = c > 0 ? zxc_decompress_inplace_bound(comp, (size_t)c) : 0;
+    uint8_t* const buf = need ? (uint8_t*)malloc(need) : NULL;
+    int64_t r = INT64_MIN;
+    if (buf) {
+        memcpy(buf + need - (size_t)c, comp, (size_t)c);
+        r = zxc_decompress_inplace_dctx(d, buf, need, (size_t)c, dop);
+    }
+    free(buf);
+    free(comp);
+    return r;
+}
+
+/* In-place decode through a caller-owned context, static then heap. */
+int test_static_dctx_inplace(void) {
+    printf("=== TEST: Static Context API - in-place decode ===\n");
+
+    const size_t N = 1u << 20;
+    uint8_t* const text = (uint8_t*)malloc(N);
+    uint8_t* const noise = (uint8_t*)malloc(N);
+    if (!text || !noise) {
+        free(text);
+        free(noise);
+        return 0;
+    }
+    fill_payload(text, N);
+    uint64_t s = 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0; i < N; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        noise[i] = (uint8_t)(s >> 56);
+    }
+
+    int ok = 1;
+    const size_t sizes[] = {ZXC_BLOCK_SIZE_MIN, 64 * 1024};
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        const size_t bs = sizes[k];
+        const size_t ws_sz = zxc_static_dctx_workspace_size(bs);
+        void* const ws = test_aligned_alloc(64, ws_sz);
+        zxc_dctx* const d = ws ? zxc_init_static_dctx(ws, ws_sz, bs) : NULL;
+        if (!d) {
+            printf("  [FAIL] init_static_dctx(%zu)\n", bs);
+            test_aligned_free(ws);
+            ok = 0;
+            continue;
+        }
+        char label[64];
+        /* One context, several archives. */
+        snprintf(label, sizeof(label), "static %zuK, pattern L3", bs >> 10);
+        ok &= inplace_dctx_case(d, label, text, N, 3, 1, bs);
+        snprintf(label, sizeof(label), "static %zuK, noise L1 (overlap)", bs >> 10);
+        ok &= inplace_dctx_case(d, label, noise, N, 1, 0, bs);
+        snprintf(label, sizeof(label), "static %zuK, pattern L7", bs >> 10);
+        ok &= inplace_dctx_case(d, label, text, N, 7, 1, bs);
+
+        /* The static context's own refusals. */
+        const zxc_decompress_opts_t with_dict = {.dict = text, .dict_size = 1024};
+        const int64_t r_bs = inplace_refusal(d, text, 64 * 1024, bs * 2, NULL);
+        const int64_t r_dict = inplace_refusal(d, text, 64 * 1024, bs, &with_dict);
+        if (r_bs != ZXC_ERROR_BAD_BLOCK_SIZE || r_dict != ZXC_ERROR_DICT_UNSUPPORTED) {
+            printf("  [FAIL] static %zuK: foreign block size -> %lld, dict -> %lld\n", bs >> 10,
+                   (long long)r_bs, (long long)r_dict);
+            ok = 0;
+        }
+        zxc_free_dctx(d); /* no-op */
+        test_aligned_free(ws);
+    }
+
+    zxc_dctx* const h = zxc_create_dctx();
+    ok &= h && inplace_dctx_case(h, "heap dctx, noise L3 (overlap)", noise, N, 3, 1, 0);
+    zxc_free_dctx(h);
+
+    /* Caller errors. */
+    uint8_t tiny[64] = {0};
+    if (zxc_decompress_inplace_dctx(NULL, tiny, sizeof(tiny), 32, NULL) != ZXC_ERROR_NULL_INPUT) {
+        printf("  [FAIL] NULL dctx not rejected\n");
+        ok = 0;
+    }
+
+    free(text);
+    free(noise);
+    if (ok) printf("PASS\n\n");
+    return ok;
+}
