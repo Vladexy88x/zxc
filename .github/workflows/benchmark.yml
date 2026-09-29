@@ -38,12 +38,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Select Latest Xcode
-        if: runner.os == 'macOS'
-        run: |
-          sudo xcode-select -s /Applications/Xcode_26.4.app
-          clang --version
-
       - name: Clone LZbench
         run: |
           git clone --depth 1 https://github.com/inikep/lzbench "${LZBENCH_DIR}"
@@ -74,7 +68,7 @@ jobs:
           SKIP_CODECS+=" DONT_BUILD_ZLIB_NG=1 DONT_BUILD_ZLING=1 DONT_BUILD_ZPAQ=1"
           SKIP_CODECS+=" DONT_BUILD_MEMLZ=1 DONT_BUILD_ACEAPEX=1 DONT_BUILD_OPENZL=1"
 
-          # Use latest available compiler per platform
+          # GCC 14 on Linux: the compiler of the published benchmarks
           if [ "$RUNNER_OS" = "Linux" ]; then
             export CC=gcc-14 CXX=g++-14
           fi

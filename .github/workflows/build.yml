@@ -60,24 +60,37 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Select Latest Compiler (Linux)
+      # GCC 14: the compiler of the published benchmarks
+      - name: Select Compiler (Linux)
         if: runner.os == 'Linux'
         run: |
           echo "CC=gcc-14" >> $GITHUB_ENV
           echo "CXX=g++-14" >> $GITHUB_ENV
           gcc-14 --version
 
-      - name: Select Latest Xcode (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          sudo xcode-select -s /Applications/Xcode_26.4.app
-          clang --version
-
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_flags }}
 
       - name: Build 
         run: cmake --build build --config Release --parallel
+
+      # The released zxc must start on glibc 2.34 (RHEL 9, Debian 12, Ubuntu 22.04).
+      - name: Check glibc floor (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          needs=$(objdump -p build/zxc | sed -n '/Version References/,$p' | grep -o 'GLIBC_[A-Z0-9_.]*' | sort -u)
+          echo "$needs"
+          # GLIBC_ABI_* markers (e.g. DT_RELR) and any version above 2.34 break the floor.
+          too_new=$(for v in $needs; do
+            case "$v" in
+              GLIBC_ABI_*) echo "$v" ;;
+              *) [ "$(printf '%s\n' 2.34 "${v#GLIBC_}" | sort -V | tail -1)" = 2.34 ] || echo "$v" ;;
+            esac
+          done)
+          if [ -n "$too_new" ]; then
+            echo "::error::zxc requires more than glibc 2.34:" $too_new
+            exit 1
+          fi
 
       - name: Test (native)
         working-directory: build
@@ -189,6 +202,8 @@ jobs:
           sha256sum "zxc-${VERSION}.tar.gz"
 
       - name: Compress the same tar with zxc
+        env:
+          CC: gcc-14
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZXC_NATIVE_ARCH=OFF \
                 -DZXC_BUILD_TESTS=OFF
@@ -330,7 +345,7 @@ jobs:
     name: Attach SLSA provenance
     needs: provenance
     if: github.event_name == 'release'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: write
     steps:
