@@ -1,7 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
 # ZXC - High-performance lossless compression
 #
-# Copyright (c) 2025-2026 Bertrand Lebonnois and contributors.
-# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) Bertrand Lebonnois and contributors.
 #
 # Installation: headers, pkg-config and the CMake package for find_package(zxc).
 

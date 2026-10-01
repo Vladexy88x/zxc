@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# ZXC - High-performance lossless compression
+#
+# Copyright (c) Bertrand Lebonnois and contributors.
+
 cmake_minimum_required(VERSION 3.20)
 project(zxc_python C)
 

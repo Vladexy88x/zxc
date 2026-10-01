@@ -220,3 +220,30 @@ jobs:
           else
             echo "No non-ASCII characters found."
           fi
+
+      - name: SPDX Header Check
+        shell: bash
+        run: |
+          # bash -e: a failing git ls-files fails the step.
+          files=$(git ls-files -- \
+            '*.c' '*.cc' '*.h' '*.rs' '*.go' '*.py' '*.pyi' '*.js' '*.mjs' '*.ts' '*.sh' '*.cmake' \
+            '*.cmake.in' '*CMakeLists.txt' '*Makefile' '*Kbuild' '*meson.build' '*meson_options.txt' '*Dockerfile')
+          [ -n "$files" ] || { echo "::error::No source file to check."; exit 1; }
+          # A comment marker, the tag, an SPDX expression, and the */ closing a block comment.
+          id='[A-Za-z0-9.+()-]+'
+          re="^(//|/\*|#) SPDX-License-Identifier: ${id}( (AND|OR|WITH) ${id})*( \*/)?$"
+          missing=0
+          while IFS= read -r f; do
+            # The tag sits on line 1, or line 2 after a shebang.
+            line=
+            { IFS= read -r line; [[ $line == '#!'* ]] && IFS= read -r line; } < "$f" || true
+            if ! [[ ${line%$'\r'} =~ $re ]]; then
+              echo "::error file=$f::Missing or malformed SPDX-License-Identifier"
+              missing=$((missing + 1))
+            fi
+          done <<< "$files"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$missing file(s) without a valid SPDX header."
+            exit 1
+          fi
+          echo "All $(grep -c "" <<< "$files") source files carry an SPDX header."
