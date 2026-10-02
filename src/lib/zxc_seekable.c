@@ -224,7 +224,7 @@ static zxc_seekable* zxc_seekable_parse(const zxc_seek_source_t* src) {
     return s;
 }
 
-/** @brief Scratch bound for @ref zxc_seek_load_spans: the groups blocks [@p first,
+/** @brief Scratch bound for @ref zxc_seek_load_spans(): the groups blocks [@p first,
  *  @p first + @p n) touch. */
 static size_t zxc_seek_spans_raw_max(const uint64_t first, const uint32_t n) {
     const uint64_t groups = (first + n - 1) / ZXC_SEEK_GROUP - first / ZXC_SEEK_GROUP + 1;

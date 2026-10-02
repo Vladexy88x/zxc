@@ -1016,7 +1016,7 @@ int64_t zxc_decompress_inplace(void* buffer, const size_t buffer_capacity, const
  * @brief Reads the decompressed size from a ZXC-compressed buffer.
  *
  * The size sits in the file footer (last @ref ZXC_FILE_FOOTER_SIZE bytes) and is
- * untrusted, so it goes through @ref zxc_read_frame_envelope: an envelope that
+ * untrusted, so it goes through @ref zxc_read_frame_envelope(): an envelope that
  * does not hold up returns 0, and callers sizing an allocation inherit the check.
  */
 uint64_t zxc_get_decompressed_size(const void* src, const size_t src_size) {
