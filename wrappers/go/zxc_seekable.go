@@ -53,10 +53,11 @@ type Seekable struct {
 	file    *C.FILE // set when opened via Open
 	srcData []byte  // in-memory source (OpenBytes); pinned for the handle's life
 	pinner  runtime.Pinner
-	rhandle cgo.Handle // valid when opened via OpenReader; zero otherwise
-	hasRH   bool       // true when rhandle is set (cgo.Handle 0 is itself valid)
-	busy    int        // calls that may run ReadAt; Close and SetDict refuse
-	ranging bool       // DecompressRange running; a nested one refuses
+	rhandle cgo.Handle  // valid when opened via OpenReader; zero otherwise
+	rctx    *seekReader // the handle's value when opened via OpenReader
+	hasRH   bool        // true when rhandle is set (cgo.Handle 0 is itself valid)
+	busy    int         // calls that may run ReadAt; Close and SetDict refuse
+	ranging bool        // DecompressRange running; a nested one refuses
 }
 
 // Open opens a seekable archive from a file path.
@@ -134,13 +135,35 @@ func OpenReader(r io.ReaderAt, size int64) (*Seekable, error) {
 	if size <= 0 {
 		return nil, ErrSrcTooSmall
 	}
-	h := cgo.NewHandle(r)
+	rc := &seekReader{r: r}
+	h := cgo.NewHandle(rc)
 	ptr := C.zxcGoOpenReader(C.uintptr_t(h), C.uint64_t(size))
 	if ptr == nil {
 		h.Delete()
+		rc.repanic()
 		return nil, ErrInvalidData
 	}
-	return &Seekable{ptr: ptr, rhandle: h, hasRH: true}, nil
+	return &Seekable{ptr: ptr, rhandle: h, rctx: rc, hasRH: true}, nil
+}
+
+// seekReader is the value behind a reader-backed handle's cgo.Handle. A panic
+// in ReadAt must not unwind through the C frames of the running call, so the
+// trampoline recovers it into pv and the Go caller re-raises it once C has
+// returned.
+type seekReader struct {
+	r        io.ReaderAt
+	panicked bool
+	pv       any
+}
+
+// repanic re-raises a panic recovered from ReadAt during the last C call.
+func (rc *seekReader) repanic() {
+	if rc == nil || !rc.panicked {
+		return
+	}
+	pv := rc.pv
+	rc.panicked, rc.pv = false, nil
+	panic(pv)
 }
 
 // The C->Go read trampoline (zxcGoSeekableReadAt) lives in
@@ -173,6 +196,7 @@ func (s *Seekable) Close() error {
 	}
 	if s.hasRH {
 		s.rhandle.Delete()
+		s.rctx = nil
 		s.hasRH = false
 	}
 	return nil
@@ -209,8 +233,9 @@ func (s *Seekable) BlockCompressedSize(blockIdx uint64) (size uint32, ok bool, e
 		return 0, false, nil
 	}
 	s.busy++
+	defer func() { s.busy-- }()
 	sz := uint32(C.zxc_seekable_get_block_comp_size(s.ptr, C.uint64_t(blockIdx)))
-	s.busy--
+	s.rctx.repanic()
 	// 0 is never a real size: the group is unreadable or invalid.
 	if sz == 0 {
 		return 0, true, ErrInvalidData
@@ -253,6 +278,7 @@ func (s *Seekable) DecompressRange(dst []byte, offset uint64, length int) (int, 
 	}
 	s.busy++
 	s.ranging = true
+	defer func() { s.ranging = false; s.busy-- }()
 	res := C.zxc_seekable_decompress_range(
 		s.ptr,
 		dptr,
@@ -260,8 +286,7 @@ func (s *Seekable) DecompressRange(dst []byte, offset uint64, length int) (int, 
 		C.uint64_t(offset),
 		C.size_t(length),
 	)
-	s.ranging = false
-	s.busy--
+	s.rctx.repanic()
 	if res < 0 {
 		return 0, errorFromCode(res)
 	}

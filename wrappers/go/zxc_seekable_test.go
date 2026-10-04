@@ -358,6 +358,48 @@ func TestSeekableReentryFromReader(t *testing.T) {
 	}
 }
 
+// A panic in ReadAt reaches the caller intact and leaves the handle usable.
+func TestSeekableReaderPanic(t *testing.T) {
+	payload := bytes.Repeat([]byte("ZXCseekable_"), 8192)
+	arc, err := os.ReadFile(buildSeekableArchive(t, payload))
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	boom := errors.New("boom")
+	recovered := func(f func()) (pv any) {
+		defer func() { pv = recover() }()
+		f()
+		return nil
+	}
+
+	rd := &hookReaderAt{inner: bytes.NewReader(arc), hook: func() { panic(boom) }}
+	if pv := recovered(func() { OpenReader(rd, int64(len(arc))) }); pv != boom {
+		t.Fatalf("OpenReader: recovered %v, want %v", pv, boom)
+	}
+
+	s, err := OpenReader(rd, int64(len(arc)))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	dst := make([]byte, len(payload))
+	calls := map[string]func(){
+		"BlockCompressedSize": func() { s.BlockCompressedSize(0) },
+		"DecompressRange":     func() { s.DecompressRange(dst, 0, len(dst)) },
+	}
+	for name, call := range calls {
+		rd.hook = func() { panic(boom) }
+		if pv := recovered(call); pv != boom {
+			t.Fatalf("%s: recovered %v, want %v", name, pv, boom)
+		}
+	}
+	if n, err := s.DecompressRange(dst, 0, len(dst)); err != nil || !bytes.Equal(dst[:n], payload) {
+		t.Fatalf("handle after the panics: n=%d err=%v", n, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close after the panics: %v", err)
+	}
+}
+
 func TestSeekableOpenReaderRejectsNilAndZero(t *testing.T) {
 	if _, err := OpenReader(nil, 100); err == nil {
 		t.Fatalf("OpenReader(nil, 100) should fail")
