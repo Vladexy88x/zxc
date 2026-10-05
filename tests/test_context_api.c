@@ -299,6 +299,171 @@ int test_context_api_seekable_frame(void) {
     return 1;
 }
 
+/* cctx with ctx_opts (NULL = sticky) and zxc_compress() with ref must write the
+ * same bytes, which must open as seekable and serve a range across blocks. */
+static int cctx_seekable_matches(const char* what, zxc_cctx* cctx, const uint8_t* src,
+                                 const size_t n, const zxc_compress_opts_t* ctx_opts,
+                                 const zxc_compress_opts_t* ref) {
+    const size_t cap = (size_t)zxc_compress_bound(n);
+    uint8_t* const a = malloc(cap);
+    uint8_t* const b = malloc(cap);
+    uint8_t* const out = malloc(n + 1);
+    int ok = 0;
+    if (!a || !b || !out) {
+        printf("  [FAIL] %s: malloc\n", what);
+        goto done;
+    }
+    const int64_t na = zxc_compress(src, n, a, cap, ref);
+    const int64_t nb = zxc_compress_cctx(cctx, src, n, b, cap, ctx_opts);
+    if (na <= 0 || nb != na || memcmp(a, b, (size_t)na) != 0) {
+        printf("  [FAIL] %s: one-shot %lld, context %lld\n", what, (long long)na, (long long)nb);
+        goto done;
+    }
+    zxc_seekable* const s = zxc_seekable_open(b, (size_t)nb);
+    if (!s) {
+        printf("  [FAIL] %s: zxc_seekable_open refused the context's archive\n", what);
+        goto done;
+    }
+    if (ref->dict) {
+        const int rc = zxc_seekable_set_dict(s, ref->dict, ref->dict_size, ref->dict_huf);
+        if (rc != ZXC_OK) {
+            printf("  [FAIL] %s: zxc_seekable_set_dict returned %d\n", what, rc);
+            zxc_seekable_free(s);
+            goto done;
+        }
+    }
+    const size_t off = n / 3, len = n / 3;
+    const int64_t r = len ? zxc_seekable_decompress_range(s, out, n, off, len) : 0;
+    zxc_seekable_free(s);
+    if (r != (int64_t)len || memcmp(out, src + off, len) != 0) {
+        printf("  [FAIL] %s: range [%zu, +%zu) returned %lld\n", what, off, len, (long long)r);
+        goto done;
+    }
+    ok = 1;
+done:
+    free(a);
+    free(b);
+    free(out);
+    return ok;
+}
+
+/* 1 if every data block of @p arc is RAW, 0 otherwise or on a malformed walk. */
+static int all_blocks_raw(const uint8_t* arc, const size_t n, const int checksum) {
+    size_t off = ZXC_FILE_HEADER_SIZE, blocks = 0;
+    zxc_block_header_t bh;
+    while (zxc_read_block_header(arc + off, n - off, &bh) == ZXC_OK) {
+        if (bh.block_type == ZXC_BLOCK_EOF) return blocks > 0;
+        if (bh.block_type != ZXC_BLOCK_RAW) return 0;
+        off += ZXC_BLOCK_HEADER_SIZE + bh.comp_size + (checksum ? ZXC_BLOCK_CHECKSUM_SIZE : 0);
+        blocks++;
+    }
+    return 0;
+}
+
+/* The context API used to drop .seekable; it now writes the table without
+ * allocating, static contexts included. */
+int test_context_api_seekable_compress(void) {
+    printf("=== TEST: Context API - seekable compression matches the one-shot ===\n");
+    /* 74 blocks of 4 KB: two seek-table groups, the second one partial. */
+    const size_t n = 74 * 4096 - 123;
+    uint8_t* const src = malloc(n);
+    static uint8_t dict[2048];
+    if (!src) {
+        printf("  [FAIL] malloc\n");
+        return 0;
+    }
+    uint32_t x = 12345;
+    for (size_t i = 0; i < n; i++) {
+        x = x * 1103515245u + 12345u;
+        src[i] = (uint8_t)((i % 97 < 60) ? 'a' + (i % 13) : (x >> 24));
+    }
+    for (size_t i = 0; i < sizeof(dict); i++) dict[i] = (uint8_t)('a' + (i % 13));
+
+    int fails = 0;
+    zxc_cctx* cctx = zxc_create_cctx(NULL);
+    if (!cctx) {
+        printf("  [FAIL] zxc_create_cctx\n");
+        free(src);
+        return 0;
+    }
+    const zxc_compress_opts_t plain = {.level = 3, .block_size = 4096, .seekable = 1};
+    const zxc_compress_opts_t cs = {
+        .level = 5, .block_size = 4096, .checksum_enabled = 1, .seekable = 1};
+    zxc_compress_opts_t with_dict = cs;
+    with_dict.dict = dict;
+    with_dict.dict_size = sizeof(dict);
+    fails += !cctx_seekable_matches("level 3", cctx, src, n, &plain, &plain);
+    fails += !cctx_seekable_matches("checksums", cctx, src, n, &cs, &cs);
+    fails += !cctx_seekable_matches("sticky (NULL opts)", cctx, src, n, NULL, &cs);
+    fails += !cctx_seekable_matches("dictionary", cctx, src, n, &with_dict, &with_dict);
+    fails += !cctx_seekable_matches("one block", cctx, src, 1000, &plain, &plain);
+    fails += !cctx_seekable_matches("empty input", cctx, src, 0, &cs, &cs);
+
+    /* Incompressible input: every data block is RAW, whose comp_size the table
+     * reads back like any other. */
+    {
+        const size_t rn = 5 * 4096 + 77;
+        const size_t rcap = (size_t)zxc_compress_bound(rn);
+        uint8_t* const noise = malloc(rn);
+        uint8_t* const rarc = malloc(rcap);
+        if (noise && rarc) {
+            zxc_test_srand(0x5EEDU);
+            for (size_t i = 0; i < rn; i++) noise[i] = (uint8_t)zxc_test_rand();
+            const int64_t rl = zxc_compress(noise, rn, rarc, rcap, &cs);
+            if (rl <= 0 || !all_blocks_raw(rarc, (size_t)rl, 1)) {
+                printf("  [FAIL] incompressible fixture is not all RAW (%lld)\n", (long long)rl);
+                fails++;
+            }
+            fails += !cctx_seekable_matches("all RAW, checksums", cctx, noise, rn, &cs, &cs);
+        } else {
+            fails++;
+        }
+        free(noise);
+        free(rarc);
+    }
+    zxc_free_cctx(cctx);
+
+    /* Created seekable, then used with NULL opts. */
+    cctx = zxc_create_cctx(&plain);
+    fails += !cctx || !cctx_seekable_matches("seekable from create", cctx, src, n, NULL, &plain);
+    zxc_free_cctx(cctx);
+
+    /* A static context cannot allocate: the table must still be written. */
+    const size_t ws_size = zxc_static_cctx_workspace_size(4096, 3);
+    void* const ws = test_aligned_alloc(64, ws_size);
+    cctx = ws ? zxc_init_static_cctx(ws, ws_size, &plain) : NULL;
+    fails += !cctx || !cctx_seekable_matches("static context", cctx, src, n, NULL, &plain);
+
+    /* A cut through the seek table or the footer: both entry points refuse it. */
+    if (cctx) {
+        const size_t cap = (size_t)zxc_compress_bound(n);
+        uint8_t* const arc = malloc(cap);
+        const int64_t full = arc ? zxc_compress(src, n, arc, cap, &plain) : -1;
+        const size_t table = zxc_seek_table_size(74);
+        const size_t cuts[] = {1, ZXC_FILE_FOOTER_SIZE, ZXC_FILE_FOOTER_SIZE + 1,
+                               ZXC_FILE_FOOTER_SIZE + table - 1, ZXC_FILE_FOOTER_SIZE + table};
+        for (size_t i = 0; full > 0 && i < sizeof(cuts) / sizeof(cuts[0]); i++) {
+            const size_t c = (size_t)full - cuts[i];
+            const int64_t r1 = zxc_compress(src, n, arc, c, &plain);
+            const int64_t r2 = zxc_compress_cctx(cctx, src, n, arc, c, NULL);
+            if (r1 != ZXC_ERROR_DST_TOO_SMALL || r2 != r1) {
+                printf("  [FAIL] capacity %zu (archive %lld): one-shot %lld, context %lld\n", c,
+                       (long long)full, (long long)r1, (long long)r2);
+                fails++;
+            }
+        }
+        if (full <= 0) fails++;
+        free(arc);
+    }
+    test_aligned_free(ws);
+    free(src);
+
+    if (fails) return 0;
+    printf("  [PASS] heap, sticky, dictionary, empty and static contexts\n");
+    printf("PASS\n\n");
+    return 1;
+}
+
 /* Pins both halves of the no-destination contract, through both entry points:
  * what the probe answers, and what a real decode of the same bytes answers.
  * They agree on every archive that reports an empty payload. On one that stores
