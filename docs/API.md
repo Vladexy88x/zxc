@@ -302,7 +302,7 @@ typedef void (*zxc_progress_callback_t)(
 );
 ```
 
-Called from the writer thread after each block is processed.
+Called from the writer thread after each block, or batch of blocks, is processed.
 Must be fast and non-blocking.
 
 ### 6.3 Opaque Context Types
@@ -1122,6 +1122,9 @@ ZXC_EXPORT int64_t zxc_stream_decompress(
 
 Decompresses `f_in` -> `f_out` using a parallel pipeline. Bytes after the footer
 are `ZXC_ERROR_CORRUPT_DATA`.
+
+A regular file is read ahead in batches; a pipe or socket is decoded block by
+block, so a live stream's output is never held back.
 
 **Returns**: total decompressed bytes written, or negative `zxc_error_t`.
 

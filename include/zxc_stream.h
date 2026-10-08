@@ -88,6 +88,9 @@ ZXC_EXPORT int64_t zxc_stream_compress(FILE* f_in, FILE* f_out, const zxc_compre
  *         (e.g. @ref ZXC_ERROR_BAD_HEADER).
  *
  * @note @p f_out is flushed before returning; see @ref zxc_stream_compress.
+ *
+ * @note A regular file is read ahead in batches; a pipe or socket is decoded block
+ *       by block, so a live stream's output is never held back.
  */
 ZXC_EXPORT int64_t zxc_stream_decompress(FILE* f_in, FILE* f_out,
                                          const zxc_decompress_opts_t* opts);

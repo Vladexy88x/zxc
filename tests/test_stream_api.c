@@ -1790,3 +1790,393 @@ int test_stream_trailing_bytes(void) {
     printf("PASS\n\n");
     return 1;
 }
+
+/* Progress callback: counts the jobs written, in a global the analysers see change. */
+static int jobs_written;
+
+static void count_jobs(const uint64_t done, const uint64_t total, const void* user_data) {
+    (void)done;
+    (void)total;
+    (void)user_data;
+    jobs_written++;
+}
+
+/* Fills @p src with blocks of @p bs bytes, each periodic and unlike its neighbours. */
+static void gen_periodic_blocks(uint8_t* src, const size_t n, const size_t bs) {
+    for (size_t i = 0; i < n; i++) src[i] = (uint8_t)("zxc stream input"[i % 16] + i / bs);
+}
+
+#if !defined(_WIN32)
+/* Decodes @p f_in into @p out through @p f_out; returns the decoder's verdict. */
+static int64_t decode_stream_into(FILE* f_in, FILE* f_out, uint8_t* out, const size_t cap,
+                                  const int n_threads) {
+    const zxc_decompress_opts_t o = {.n_threads = n_threads, .checksum_enabled = 1};
+    rewind(f_out);
+    const int64_t r = zxc_stream_decompress(f_in, f_out, &o);
+    if (r <= 0) return r;
+    rewind(f_out);
+    return ((size_t)r <= cap && fread(out, 1, (size_t)r, f_out) == (size_t)r) ? r : -1;
+}
+
+/* Rewrites @p f as a @p pad-byte hole then the archive, positioned on it. */
+static int refill_file(FILE* f, const size_t pad, const uint8_t* arc, const size_t n) {
+    rewind(f);
+    return ftruncate(fileno(f), 0) == 0 && fseek(f, (long)pad, SEEK_SET) == 0 &&
+           fwrite(arc, 1, n, f) == n && fflush(f) == 0 && fseek(f, (long)pad, SEEK_SET) == 0;
+}
+
+/* A stream that is not a regular file: a pipe, or a memory stream past its capacity. */
+static FILE* open_live_stream(const uint8_t* data, const size_t n) {
+    if (n > 4096) return fmemopen((void*)(uintptr_t)data, n, "rb");
+    int fds[2];
+    if (pipe(fds) != 0) return NULL;
+    const int fits =
+        fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0 && (n == 0 || write(fds[1], data, n) == (ssize_t)n);
+    close(fds[1]);
+    FILE* const f = fits ? fdopen(fds[0], "rb") : NULL;
+    if (!f) close(fds[0]);
+    return f;
+}
+
+/* One archive, three inputs (file, archive mid-file, live stream): same verdict and bytes. */
+static int input_kinds_agree(FILE* f_reg, FILE* f_mid, FILE* f_out, const uint8_t* arc,
+                             const size_t n, uint8_t* out[3], const size_t cap, const int n_threads,
+                             const int exact, int64_t* verdict) {
+    FILE* const f_live = open_live_stream(arc, n);
+    int64_t r[3] = {-1, -1, -1};
+    const int ready = f_live && refill_file(f_reg, 0, arc, n) && refill_file(f_mid, 777, arc, n);
+    if (ready) {
+        r[0] = decode_stream_into(f_reg, f_out, out[0], cap, n_threads);
+        r[1] = decode_stream_into(f_mid, f_out, out[1], cap, n_threads);
+        r[2] = decode_stream_into(f_live, f_out, out[2], cap, n_threads);
+    }
+    if (f_live) fclose(f_live);
+    *verdict = r[0];
+
+    // A corrupted input can fail in the reader or a worker first: only the sign must match.
+    int same = ready;
+    for (int k = 1; same && k < 3; k++) {
+        same = exact || r[0] >= 0 ? r[k] == r[0] : r[k] < 0;
+        if (same && r[0] > 0) same = memcmp(out[k], out[0], (size_t)r[0]) == 0;
+    }
+    if (!same)
+        printf("Failed: %zu-byte archive, %d threads: file %lld, mid-file %lld, stream %lld\n", n,
+               n_threads, (long long)r[0], (long long)r[1], (long long)r[2]);
+    return same;
+}
+
+/* Progress callback: empties the input file under the decoder. */
+static void shrink_input(const uint64_t done, const uint64_t total, const void* user_data) {
+    (void)done;
+    (void)total;
+    (void)!ftruncate(fileno((FILE*)(uintptr_t)user_data), 0);
+}
+
+/* Progress callback: overwrites the input file past its header, once. */
+typedef struct {
+    FILE* f;
+    const uint8_t* image;
+    size_t size;
+    int fired;
+} rewrite_t;
+
+static void rewrite_input(const uint64_t done, const uint64_t total, const void* user_data) {
+    (void)done;
+    (void)total;
+    rewrite_t* const w = (rewrite_t*)(uintptr_t)user_data;
+    if (w->fired++) return;
+    (void)!pwrite(fileno(w->f), w->image + ZXC_FILE_HEADER_SIZE, w->size - ZXC_FILE_HEADER_SIZE,
+                  ZXC_FILE_HEADER_SIZE);
+}
+
+#endif
+
+/* A regular file and a live stream must agree on every archive: intact, cut at any
+ * byte, or with any byte corrupted. */
+int test_stream_input_kinds(void) {
+    printf("=== TEST: Stream - file and live stream inputs agree ===\n");
+#if !defined(_WIN32)
+    const size_t sizes[] = {4096, 64 * 1024};
+    int ok = 1;
+
+    for (size_t s = 0; ok && s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        const size_t bs = sizes[s];
+        const size_t n = 3 * bs + 5;
+        const size_t cap = (size_t)zxc_compress_bound(n);
+        uint8_t* const src = malloc(n);
+        uint8_t* const arc = malloc(cap + 1);
+        uint8_t* const bad = malloc(cap + 1);
+        uint8_t* out[3] = {malloc(n), malloc(n), malloc(n)};
+        FILE* const f_reg = tmpfile();
+        FILE* const f_mid = tmpfile();
+        FILE* const f_out = tmpfile();
+        ok = src && arc && bad && out[0] && out[1] && out[2] && f_reg && f_mid && f_out;
+
+        // Periodic blocks: the archive fits a pipe.
+        if (ok) gen_periodic_blocks(src, n, bs);
+
+        for (int v = 0; ok && v < 2; v++) {
+            const zxc_compress_opts_t co = {
+                .level = 3, .block_size = bs, .checksum_enabled = !v, .seekable = v};
+            const int64_t len = zxc_compress(src, n, arc, cap, &co);
+            int64_t r = 0;
+            if (len <= 0 || len > 2048) {
+                printf("Failed: archive of %lld bytes\n", (long long)len);
+                ok = 0;
+                break;
+            }
+            const size_t alen = (size_t)len;
+
+            // Intact, then one trailing byte.
+            for (int t = 1; ok && t <= 3; t++)
+                ok = input_kinds_agree(f_reg, f_mid, f_out, arc, alen, out, n, t, 1, &r) &&
+                     r == (int64_t)n && memcmp(out[0], src, n) == 0;
+            arc[alen] = 0;
+            ok = ok && input_kinds_agree(f_reg, f_mid, f_out, arc, alen + 1, out, n, 2, 1, &r) &&
+                 r == ZXC_ERROR_CORRUPT_DATA;
+
+            // Cut at every byte.
+            for (size_t t = 0; ok && t < alen; t++)
+                ok = input_kinds_agree(f_reg, f_mid, f_out, arc, t, out, n, 2 + t % 2, 1, &r) &&
+                     r < 0;
+
+            // Every byte corrupted in turn.
+            for (size_t t = 0; ok && t < alen; t++) {
+                memcpy(bad, arc, alen);
+                bad[t] ^= 0xFF;
+                ok = input_kinds_agree(f_reg, f_mid, f_out, bad, alen, out, n, 2 + t % 2, 0, &r);
+            }
+        }
+
+        free(src);
+        free(arc);
+        free(bad);
+        for (int k = 0; k < 3; k++) free(out[k]);
+        if (f_reg) fclose(f_reg);
+        if (f_mid) fclose(f_mid);
+        if (f_out) fclose(f_out);
+    }
+    if (!ok) return 0;
+    printf("PASS\n\n");
+#else
+    printf("  [SKIP] needs POSIX pipes\n\n");
+#endif
+    return 1;
+}
+
+/* A file truncated during the decode is an I/O error, in the reader or in a worker. */
+int test_stream_input_shrinks(void) {
+    printf("=== TEST: Stream - input file truncated during the decode ===\n");
+#if !defined(_WIN32)
+    const size_t bs = 64 * 1024;
+    const size_t n = 256 * bs;
+    const size_t cap = (size_t)zxc_compress_bound(n);
+    uint8_t* const src = malloc(n);
+    uint8_t* const arc = malloc(cap);
+    int ok = src && arc;
+
+    // Incompressible: far more blocks than the ring holds when the first job is reported.
+    const zxc_compress_opts_t co = {.level = 1, .block_size = bs, .checksum_enabled = 1};
+    int64_t len = 0;
+    if (ok) {
+        gen_random_data(src, n);
+        len = zxc_compress(src, n, arc, cap, &co);
+        ok = len >= (int64_t)n;
+    }
+
+    for (int n_threads = 1; ok && n_threads <= 4; n_threads++) {
+        FILE* const f_arc = tmpfile();
+        ok = f_arc && fwrite(arc, 1, (size_t)len, f_arc) == (size_t)len && fflush(f_arc) == 0;
+        if (ok) {
+            const zxc_decompress_opts_t dopts = {.n_threads = n_threads,
+                                                 .checksum_enabled = 1,
+                                                 .progress_cb = shrink_input,
+                                                 .user_data = f_arc};
+            rewind(f_arc);
+            // A read sees the cut (I/O error), or the reader meets the end (truncation).
+            const int64_t r = zxc_stream_decompress(f_arc, NULL, &dopts);
+            ok = r == ZXC_ERROR_IO || r == ZXC_ERROR_SRC_TOO_SMALL;
+            if (!ok) printf("Failed: %d threads -> %lld\n", n_threads, (long long)r);
+        }
+        if (f_arc) fclose(f_arc);
+    }
+
+    free(src);
+    free(arc);
+    if (!ok) return 0;
+    printf("PASS\n\n");
+#else
+    printf("  [SKIP] needs POSIX ftruncate\n\n");
+#endif
+    return 1;
+}
+
+/* A file rewritten during the decode, after the reader measured its jobs: blocks that
+ * overflow a job's output, or overrun its input, must fail within the buffers. */
+int test_stream_input_rewritten(void) {
+    printf("=== TEST: Stream - input file rewritten during the decode ===\n");
+#if !defined(_WIN32)
+    const size_t bs = 64 * 1024;
+    const size_t n = 256 * bs;
+    const size_t cap = (size_t)zxc_compress_bound(n);
+    uint8_t* const src = malloc(n);
+    uint8_t* const arc = malloc(cap);
+    uint8_t* const evil = malloc(cap);
+    uint8_t* const tiny = malloc((size_t)zxc_compress_bound(bs));
+    int ok = src && arc && evil && tiny;
+
+    // No checksums: the tiny block is valid wherever it lands.
+    const zxc_compress_opts_t co = {.level = 1, .block_size = bs};
+    int64_t len = 0;
+    zxc_block_header_t bh = {0};
+    size_t tiny_sz = 0;
+    if (ok) {
+        gen_periodic_blocks(src, bs, bs);
+        ok = zxc_compress(src, bs, tiny, (size_t)zxc_compress_bound(bs), &co) > 0 &&
+             zxc_read_block_header(tiny + ZXC_FILE_HEADER_SIZE, ZXC_BLOCK_HEADER_SIZE, &bh) ==
+                 ZXC_OK;
+        tiny_sz = ZXC_BLOCK_HEADER_SIZE + bh.comp_size;
+        gen_random_data(src, n);
+        len = zxc_compress(src, n, arc, cap, &co);
+        ok = ok && len >= (int64_t)n && tiny_sz < 1024;
+    }
+
+    for (int kind = 0; ok && kind < 2; kind++) {
+        // Per job (four blocks): copies of the tiny block, or a last block claiming
+        // 2000 bytes past the job's end.
+        memcpy(evil, arc, (size_t)len);
+        size_t off = ZXC_FILE_HEADER_SIZE;
+        for (size_t b = 0; ok && b < 256; b += 4) {
+            const size_t start = off;
+            size_t last = off;
+            for (int k = 0; ok && k < 4; k++) {
+                ok = zxc_read_block_header(arc + off, ZXC_BLOCK_HEADER_SIZE, &bh) == ZXC_OK;
+                last = off;
+                off += ZXC_BLOCK_HEADER_SIZE + bh.comp_size;
+            }
+            if (kind == 0) {
+                for (size_t o = start; ok && o < off; o++)
+                    evil[o] = tiny[ZXC_FILE_HEADER_SIZE + (o - start) % tiny_sz];
+            } else {
+                bh.comp_size += 2000;
+                ok = ok && zxc_write_block_header(evil + last, ZXC_BLOCK_HEADER_SIZE, &bh) > 0;
+            }
+        }
+
+        for (int n_threads = 2; ok && n_threads <= 4; n_threads++) {
+            FILE* const f_arc = tmpfile();
+            ok = f_arc && fwrite(arc, 1, (size_t)len, f_arc) == (size_t)len && fflush(f_arc) == 0;
+            if (ok) {
+                rewrite_t w = {f_arc, evil, (size_t)len, 0};
+                const zxc_decompress_opts_t dopts = {
+                    .n_threads = n_threads, .progress_cb = rewrite_input, .user_data = &w};
+                rewind(f_arc);
+                const int64_t r = zxc_stream_decompress(f_arc, NULL, &dopts);
+                ok = r < 0;
+                if (!ok)
+                    printf("Failed: rewrite %d, %d threads -> %lld\n", kind, n_threads,
+                           (long long)r);
+            }
+            if (f_arc) fclose(f_arc);
+        }
+    }
+
+    free(src);
+    free(arc);
+    free(evil);
+    free(tiny);
+    if (!ok) return 0;
+    printf("PASS\n\n");
+#else
+    printf("  [SKIP] needs POSIX pwrite\n\n");
+#endif
+    return 1;
+}
+
+/* A file's small blocks travel in batches, a live stream's one by one: same bytes,
+ * same verdict when cut or corrupted where a batch ends. */
+int test_stream_block_batches(void) {
+    printf("=== TEST: Stream - small blocks decoded in batches from a file ===\n");
+    const size_t bs = 4096;
+    const size_t n = 200 * bs + 5;
+    const size_t cap = (size_t)zxc_compress_bound(n);
+    uint8_t* const src = malloc(n);
+    uint8_t* const arc = malloc(cap);
+    uint8_t* const bad = malloc(cap);
+    uint8_t* out[3] = {malloc(n), malloc(n), malloc(n)};
+    FILE* const f_reg = tmpfile();
+    FILE* const f_mid = tmpfile();
+    FILE* const f_out = tmpfile();
+    int ok = src && arc && bad && out[0] && out[1] && out[2] && f_reg && f_mid && f_out;
+
+    const zxc_compress_opts_t co = {.level = 3, .block_size = bs, .checksum_enabled = 1};
+    int64_t len = 0;
+    if (ok) {
+        gen_periodic_blocks(src, n, bs);
+        len = zxc_compress(src, n, arc, cap, &co);
+        ok = len > 0 && fwrite(arc, 1, (size_t)len, f_reg) == (size_t)len;
+    }
+
+    // From a file: the right bytes, in fewer jobs than the 201 blocks.
+    for (int t = 1; ok && t <= 4; t++) {
+        const zxc_decompress_opts_t dopts = {
+            .n_threads = t, .checksum_enabled = 1, .progress_cb = count_jobs};
+        jobs_written = 0;
+        rewind(f_reg);
+        rewind(f_out);
+        const int64_t r = zxc_stream_decompress(f_reg, f_out, &dopts);
+        rewind(f_out);
+        ok = r == (int64_t)n && fread(out[0], 1, n, f_out) == n && memcmp(out[0], src, n) == 0 &&
+             jobs_written >= 1 && jobs_written < 201;
+        if (!ok) printf("Failed: %d threads -> %lld in %d jobs\n", t, (long long)r, jobs_written);
+    }
+
+#if !defined(_WIN32)
+    const size_t alen = (size_t)len;
+    // From a live stream: one job per block, the same bytes.
+    if (ok) {
+        int64_t r = 0;
+        const zxc_decompress_opts_t dopts = {
+            .n_threads = 2, .checksum_enabled = 1, .progress_cb = count_jobs};
+        jobs_written = 0;
+        FILE* const f_live = open_live_stream(arc, alen);
+        ok = f_live && zxc_stream_decompress(f_live, NULL, &dopts) == (int64_t)n &&
+             jobs_written == 201;
+        if (!ok) printf("Failed: %d jobs from the live stream\n", jobs_written);
+        if (f_live) fclose(f_live);
+        for (int t = 1; ok && t <= 4; t++)
+            ok = input_kinds_agree(f_reg, f_mid, f_out, arc, alen, out, n, t, 1, &r) &&
+                 r == (int64_t)n;
+    }
+
+    // Cut, then corrupted, around the first bytes of blocks 64 and 128.
+    size_t off = ZXC_FILE_HEADER_SIZE;
+    for (size_t b = 0; ok && b <= 128; b++) {
+        if (b == 64 || b == 128) {
+            for (size_t t = off - 12; ok && t <= off + 12; t++) {
+                int64_t r = 0;
+                ok = input_kinds_agree(f_reg, f_mid, f_out, arc, t, out, n, 1 + t % 3, 1, &r) &&
+                     r < 0;
+                memcpy(bad, arc, alen);
+                bad[t] ^= 0xFF;
+                ok = ok &&
+                     input_kinds_agree(f_reg, f_mid, f_out, bad, alen, out, n, 1 + t % 3, 0, &r);
+            }
+        }
+        zxc_block_header_t bh;
+        ok = ok && zxc_read_block_header(arc + off, ZXC_BLOCK_HEADER_SIZE, &bh) == ZXC_OK;
+        off += ZXC_BLOCK_HEADER_SIZE + bh.comp_size + ZXC_BLOCK_CHECKSUM_SIZE;
+    }
+#endif
+
+    free(src);
+    free(arc);
+    free(bad);
+    for (int k = 0; k < 3; k++) free(out[k]);
+    if (f_reg) fclose(f_reg);
+    if (f_mid) fclose(f_mid);
+    if (f_out) fclose(f_out);
+    if (!ok) return 0;
+    printf("PASS\n\n");
+    return 1;
+}

@@ -106,10 +106,15 @@ static const test_entry_t g_tests[] = {
     TEST_CASE(test_stream_get_decompressed_size_errors),
     TEST_CASE(test_stream_engine_errors),
     TEST_CASE(test_stream_trailing_bytes),
+    TEST_CASE(test_stream_input_kinds),
+    TEST_CASE(test_stream_input_shrinks),
+    TEST_CASE(test_stream_input_rewritten),
+    TEST_CASE(test_stream_block_batches),
 
     /* --- Containers: concatenated frames --- */
     TEST_CASE(test_container_concat),
     TEST_CASE(test_container_frame_walk),
+    TEST_CASE(test_container_engine_reuse),
     TEST_CASE(test_container_seekable),
 
     /* --- Push Streaming API --- */
