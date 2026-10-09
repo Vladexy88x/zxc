@@ -29,8 +29,15 @@ sudo cp -r zxc-<version>-linux-x86_64/* /usr/local/
 ```
 
 Linux and macOS archives hold `bin/zxc`, `include/`, `lib/libzxc.a`, `lib/pkgconfig/libzxc.pc` and
-`lib/cmake/zxc/zxcConfig.cmake`. Windows ZIP archives hold `bin/zxc.exe`, `include/`,
-`lib/zxc.lib`, `lib/pkgconfig/libzxc.pc` and `lib/cmake/zxc/zxcConfig.cmake`.
+`lib/cmake/zxc/zxcConfig.cmake`. Windows ZIP archives are built with MinGW-w64 on the UCRT, which Windows 10 and later include
+(GCC on x86_64, Clang on ARM64), and need no other runtime: `bin/zxc.exe`; `bin/libzxc.dll` with
+its MinGW import library `lib/libzxc.dll.a`; `lib/libzxc.def`, the DLL's export list; the static
+`lib/libzxc.a` for UCRT MinGW toolchains (MSYS2 UCRT64 or CLANG64 on x86_64, CLANGARM64 on ARM64),
+with `lib/pkgconfig/libzxc.pc` and `lib/cmake/zxc/zxcConfig.cmake`, which also target MinGW; and
+`include/`. As with every MinGW library, `-lzxc` links the DLL and `-static` the static library.
+MSVC users build their own import library (`lib /def:lib\libzxc.def /out:zxc.lib /machine:x64`, or
+`arm64`), define `ZXC_DLL_IMPORT`, and build with the release shared UCRT (`/MD`, not `/MDd`) to
+pass `FILE*`s to the DLL; for a static MSVC library, build zxc from source (vcpkg, Conan, CMake).
 
 Release tags are PGP-signed. Check the key's fingerprint against the one published in
 [SECURITY.md](../.github/SECURITY.md) *before* importing it — otherwise the import is circular, and
@@ -101,9 +108,9 @@ Installing into a system prefix needs `sudo` on Unix or an elevated shell on Win
 
 | Option | Default (standalone) | Default (vendored) | Description |
 |--------|----------------------|--------------------|-------------|
-| `BUILD_SHARED_LIBS` | OFF | OFF | Build shared libraries instead of static (`libzxc.so`, `libzxc.dylib`, `zxc.dll`) |
+| `BUILD_SHARED_LIBS` | OFF | OFF | Build shared libraries instead of static (`libzxc.so`, `libzxc.dylib`, `libzxc.dll`) |
 | `ZXC_NATIVE_ARCH` | ON | OFF | Enable `-march=native` for maximum performance |
-| `ZXC_ENABLE_LTO` | ON | OFF | Enable Link-Time Optimization (LTO) |
+| `ZXC_ENABLE_LTO` | OFF | OFF | Enable Link-Time Optimization (LTO) |
 | `ZXC_PGO_MODE` | OFF | OFF | Profile-Guided Optimization mode (`OFF`, `GENERATE`, `USE`) |
 | `ZXC_BUILD_CLI` | ON | OFF | Build command-line interface |
 | `ZXC_BUILD_TESTS` | ON | OFF | Build unit tests |
@@ -201,7 +208,7 @@ switching between a vendored copy and `find_package(zxc)` needs no other
 change.
 
 When zxc is not the top-level project it builds the library only: the CLI, the
-tests, `-march=native`, LTO and the install rules all default to off, so the
+tests, `-march=native` and the install rules all default to off, so the
 embedding project keeps full control of its own CTest registration and install
 set. Any of them can still be turned back on explicitly (`-DZXC_BUILD_CLI=ON`,
 `-DZXC_NATIVE_ARCH=ON`, `-DZXC_INSTALL=ON`, ...). `-march=native` is also

@@ -90,7 +90,8 @@ jobs:
         shell: bash
         run: |
           # Initialize variables
-          EXTRA_ARGS="-DZXC_NATIVE_ARCH=OFF -DCMAKE_COMPILE_WARNING_AS_ERROR=ON" # Runtime dispatch
+          # LTO is off by default: tested here.
+          EXTRA_ARGS="-DZXC_NATIVE_ARCH=OFF -DZXC_ENABLE_LTO=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON"
           
           # Setup Environment for Linux/Mac (Flags & Cross-compilation)
           if [ "${{ matrix.os }}" != "windows" ]; then
@@ -145,6 +146,10 @@ jobs:
               if [ -z "${{ matrix.cross_compiler_c }}" ]; then
                   echo "Running Tests for $LIB_TYPE..."
                   ctest --test-dir $BUILD_DIR -C Release --output-on-failure
+                  # The 32-bit and the /MD (shared UCRT) MSVC CLIs are only tested here.
+                  if [ "${{ matrix.os }}" = "windows" ]; then
+                      ./tests/test_cli.sh "$BUILD_DIR/Release/zxc.exe"
+                  fi
               else
                   echo "Skipping tests for $LIB_TYPE (Cross-compilation)"
               fi

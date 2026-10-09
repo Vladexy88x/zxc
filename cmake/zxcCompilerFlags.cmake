@@ -26,6 +26,17 @@ elseif(NOT MSVC)
     add_compile_definitions(_GNU_SOURCE)
 endif()
 
+# GCC on Win64 may spill AVX vectors with aligned moves onto a 16-byte-aligned
+# stack (PR54412): unaligned moves instead (binutils 2.38+).
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND WIN32 AND ZXC_TARGET_X86)
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag("-Wa,-muse-unaligned-vector-move" ZXC_HAS_UNALIGNED_VECTOR_MOVE)
+    if(ZXC_HAS_UNALIGNED_VECTOR_MOVE)
+        add_compile_options(-Wa,-muse-unaligned-vector-move)
+        add_link_options(-Wa,-muse-unaligned-vector-move)
+    endif()
+endif()
+
 # Check for LTO support
 if(ZXC_ENABLE_LTO AND NOT ZXC_ENABLE_COVERAGE)
     include(CheckIPOSupported)
@@ -93,9 +104,10 @@ set(ZXC_WARNING_FLAGS
 macro(zxc_apply_warnings target)
     if(MSVC)
         # /wd4244: block-bounded uint64->size_t narrowing, lossless.
-        target_compile_options(${target} PRIVATE /wd4244)
+        # /wd4310: constants truncated on purpose by a cast.
+        target_compile_options(${target} PRIVATE /wd4244 /wd4310)
         if(PROJECT_IS_TOP_LEVEL)
-            target_compile_options(${target} PRIVATE /W3)
+            target_compile_options(${target} PRIVATE /W4)
         endif()
     elseif(PROJECT_IS_TOP_LEVEL)
         target_compile_options(${target} PRIVATE ${ZXC_WARNING_FLAGS})

@@ -36,6 +36,10 @@
 #include <io.h>
 #include <windows.h>
 
+#ifdef __MINGW32__
+int _dowildcard = -1;  // MinGW-w64 globs argv, as setargv.obj does for MSVC
+#endif
+
 // Map POSIX macros to MSVC equivalents
 #define F_OK 0
 #define access _access
@@ -395,7 +399,11 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
     int overall_ret = 0;
 #ifdef _WIN32
     char search_path[MAX_PATH];
-    snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+    const int sn = snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+    if (sn < 0 || (size_t)sn >= sizeof(search_path)) {
+        zxc_log("Error: path too long '%s'\n", dir_path);
+        return 1;
+    }
 
     WIN32_FIND_DATAA find_data;
     HANDLE hFind = FindFirstFileA(search_path, &find_data);
@@ -411,7 +419,22 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
         }
 
         char full_path[MAX_PATH];
-        snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, find_data.cFileName);
+        const int n =
+            snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, find_data.cFileName);
+        if (n < 0 || (size_t)n >= sizeof(full_path)) {
+            zxc_log("Error: path too long in directory '%s'\n", dir_path);
+            overall_ret = 1;
+            continue;
+        }
+
+        // Links stay out of the walk; other reparse points
+        // (OneDrive placeholders) are files.
+        if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+            (find_data.dwReserved0 == IO_REPARSE_TAG_SYMLINK ||
+             find_data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT)) {
+            zxc_log("Warning: '%s' is a link, ignored\n", full_path);
+            continue;
+        }
 
         if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             overall_ret |= process_directory(full_path, mode, num_threads, keep_input, force,
@@ -430,6 +453,11 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
                                                json_output, seekable, dict, dict_size);
         }
     } while (FindNextFileA(hFind, &find_data) != 0);
+    const DWORD walk_err = GetLastError();
+    if (walk_err != ERROR_NO_MORE_FILES) {
+        zxc_log("Error reading directory '%s' (error %lu)\n", dir_path, (unsigned long)walk_err);
+        overall_ret = 1;
+    }
 
     FindClose(hFind);
 #else
@@ -439,8 +467,16 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
         return 1;
     }
 
-    const struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
+    for (;;) {
+        errno = 0;  // readdir signals an error only through errno
+        const struct dirent* const entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                zxc_log("Error reading directory '%s': %s\n", dir_path, strerror(errno));
+                overall_ret = 1;
+            }
+            break;
+        }
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
@@ -449,6 +485,7 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
         char* const full_path = malloc(path_len);
         if (!full_path) {
             zxc_log("Error allocating memory for path in directory '%s'\n", dir_path);
+            overall_ret = 1;
             continue;
         }
 
@@ -456,12 +493,16 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
         if (n < 0 || (size_t)n >= path_len) {
             zxc_log("Error: path too long in directory '%s'\n", dir_path);
             free(full_path);
+            overall_ret = 1;
             continue;
         }
 
+        // lstat: links stay out of the walk.
         struct stat st;
-        if (stat(full_path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
+        if (lstat(full_path, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) {
+                zxc_log("Warning: '%s' is a link, ignored\n", full_path);
+            } else if (S_ISDIR(st.st_mode)) {
                 overall_ret |= process_directory(full_path, mode, num_threads, keep_input, force,
                                                  to_stdout, checksum, level, block_size,
                                                  json_output, seekable, dict, dict_size);
@@ -478,6 +519,9 @@ static int process_directory(const char* dir_path, zxc_mode_t mode, int num_thre
                                                    force, to_stdout, checksum, level, block_size,
                                                    json_output, seekable, dict, dict_size);
             }
+        } else if (errno != ENOENT) {  // ENOENT: removed during the walk
+            zxc_log("Error accessing '%s': %s\n", full_path, strerror(errno));
+            overall_ret = 1;
         }
         free(full_path);
     }
@@ -999,11 +1043,11 @@ static int zxc_list_archive(const char* path, int json_output, int show_name) {
  *         -1 if the layout could not be read.
  */
 static int zxc_archive_has_checksum(FILE* f) {
-    cli_container_t c;
+    cli_container_t c = {0};
     if (fseeko(f, 0, SEEK_END) != 0) return -1;
     const long long size = ftello(f);
     const int rc = size < 0 ? ZXC_ERROR_IO : zxc_cli_walk(f, (uint64_t)size, &c);
-    if (size >= 0) free(c.dict_ids);
+    free(c.dict_ids);
     if (rc != ZXC_OK) {
         fseeko(f, 0, SEEK_SET);
         return -1;
@@ -1365,7 +1409,7 @@ int main(int argc, char** argv) {
     zxc_mode_t mode = MODE_COMPRESS;
 
     /* When invoked as "unzxc" (typically a symlink to zxc), default to
-     * decompression -- like unzstd / gunzip. An explicit -z/-d/-l/-t/-b below
+     * decompression. An explicit -z/-d/-l/-t/-b below
      * still overrides this default. */
     {
         const char* prog = (argc > 0 && argv[0]) ? argv[0] : "zxc";
