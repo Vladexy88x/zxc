@@ -267,6 +267,7 @@ static PyObject* pyzxc_compress(PyObject* self, PyObject* args, PyObject* kwargs
     Py_buffer view;
     int level = ZXC_LEVEL_DEFAULT;
     int checksum = 0;
+    int seekable = 0;
     Py_buffer dict_view = {0};
     PyObject* dict_obj = NULL;
     int have_dict = 0;
@@ -274,10 +275,10 @@ static PyObject* pyzxc_compress(PyObject* self, PyObject* args, PyObject* kwargs
     uint8_t huf_local[ZXC_HUF_TABLE_SIZE];
     const void* dict_huf = NULL;
 
-    static char* kwlist[] = {"data", "level", "checksum", "dict", "dict_huf", NULL};
+    static char* kwlist[] = {"data", "level", "checksum", "dict", "dict_huf", "seekable", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|ipOO", kwlist, &view, &level, &checksum,
-                                     &dict_obj, &dict_huf_obj)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|ipOOp", kwlist, &view, &level, &checksum,
+                                     &dict_obj, &dict_huf_obj, &seekable)) {
         return NULL;
     }
 
@@ -331,6 +332,7 @@ static PyObject* pyzxc_compress(PyObject* self, PyObject* args, PyObject* kwargs
     zxc_compress_opts_t copts = {0};
     copts.level = level;
     copts.checksum_enabled = checksum;
+    copts.seekable = seekable;
     if (have_dict) {
         copts.dict = dict_view.buf;
         copts.dict_size = (size_t)dict_view.len;
@@ -1060,6 +1062,7 @@ typedef struct {
     int has_huf;
     int level;
     int checksum;
+    int seekable;
 } pyzxc_cctx_holder_t;
 
 typedef struct {
@@ -1138,12 +1141,13 @@ static PyObject* pyzxc_cctx_create(PyObject* self, PyObject* args, PyObject* kwa
     (void)self;
     int level = ZXC_LEVEL_DEFAULT;
     int checksum = 0;
+    int seekable = 0;
     PyObject* dict_obj = NULL;
     PyObject* huf_obj = NULL;
 
-    static char* kwlist[] = {"level", "checksum", "dict", "dict_huf", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|ipOO", kwlist, &level, &checksum, &dict_obj,
-                                     &huf_obj)) {
+    static char* kwlist[] = {"level", "checksum", "dict", "dict_huf", "seekable", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|ipOOp", kwlist, &level, &checksum, &dict_obj,
+                                     &huf_obj, &seekable)) {
         return NULL;
     }
 
@@ -1152,6 +1156,7 @@ static PyObject* pyzxc_cctx_create(PyObject* self, PyObject* args, PyObject* kwa
     memset(h, 0, sizeof(*h));
     h->level = level;
     h->checksum = checksum;
+    h->seekable = seekable;
     if (pyzxc_ctx_take_dict(dict_obj, huf_obj, &h->dict, &h->dict_size, h->huf, &h->has_huf) < 0) {
         PyMem_Free(h);
         return NULL;
@@ -1160,6 +1165,7 @@ static PyObject* pyzxc_cctx_create(PyObject* self, PyObject* args, PyObject* kwa
     zxc_compress_opts_t copts = {0};
     copts.level = level;
     copts.checksum_enabled = checksum;
+    copts.seekable = seekable;
     h->cctx = zxc_create_cctx(&copts);
     if (!h->cctx) {
         PyMem_Free(h->dict);
@@ -1245,6 +1251,7 @@ static PyObject* pyzxc_cctx_compress(PyObject* self, PyObject* args) {
     zxc_compress_opts_t copts = {0};
     copts.level = h->level;
     copts.checksum_enabled = h->checksum;
+    copts.seekable = h->seekable;
     copts.dict = h->dict;
     copts.dict_size = h->dict_size;
     copts.dict_huf = h->has_huf ? h->huf : NULL;

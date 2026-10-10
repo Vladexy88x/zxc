@@ -93,7 +93,7 @@ A seekable archive can be decompressed block by block, without reading what
 comes before:
 
 ```python
-blob = ...  # produced with stream_compress(..., seekable=True)
+blob = zxc.compress(data, seekable=True)  # or Cctx(seekable=True), stream_compress(..., seekable=True)
 
 with zxc.Seekable(blob) as s:
     print(s.num_blocks, s.decompressed_size)
