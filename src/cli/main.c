@@ -1194,15 +1194,10 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     if (use_stdout) _setmode(_fileno(stdout), _O_BINARY);
 
 #else
-    // On POSIX systems, there's no text/binary distinction, but we ensure
-    // no buffering issues occur by using freopen if needed
+    // POSIX has no binary mode. Never reopen stdout: "wb" truncates a >> target.
     if (use_stdin) {
         if (!freopen(NULL, "rb", stdin))
             zxc_log("Warning: Failed to reopen stdin in binary mode\n");
-    }
-    if (use_stdout) {
-        if (!freopen(NULL, "wb", stdout))
-            zxc_log("Warning: Failed to reopen stdout in binary mode\n");
     }
 #endif
 
@@ -1409,10 +1404,11 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
  */
 int main(int argc, char** argv) {
     zxc_mode_t mode = MODE_COMPRESS;
+    int to_stdout = 0;
+    int cat_mode = 0;
 
-    /* When invoked as "unzxc" (typically a symlink to zxc), default to
-     * decompression. An explicit -z/-d/-l/-t/-b below
-     * still overrides this default. */
+    /* As "unzxc", default to decompression; as "zxccat", to zxc -dc on every
+     * argument. An explicit mode flag below still wins. */
     {
         const char* prog = (argc > 0 && argv[0]) ? argv[0] : "zxc";
         const char* slash = strrchr(prog, '/');
@@ -1422,12 +1418,15 @@ int main(int argc, char** argv) {
 #endif
         const char* base = slash ? slash + 1 : prog;
         if (strstr(base, "unzxc")) mode = MODE_DECOMPRESS;
+        if (strstr(base, "zxccat")) {
+            mode = MODE_DECOMPRESS;
+            to_stdout = cat_mode = 1;
+        }
     }
 
     int num_threads = 0;
     int keep_input = 0;
     int force = 0;
-    int to_stdout = 0;
     int bench_seconds = 5;
     int checksum = -1;
     int level = 3;
@@ -2201,7 +2200,7 @@ int main(int argc, char** argv) {
                                                block_size, json_output, seekable, dict, dict_size);
         }
 
-        if (!multiple_mode) {
+        if (!multiple_mode && !cat_mode) {
             break;  // Standard mode only does the first argument as input
         }
     }
