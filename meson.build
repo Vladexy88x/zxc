@@ -244,12 +244,19 @@ if not meson.is_subproject() and get_option('build_cli')
     install : true,
   )
 
-  # "unzxc" (zxc -d) and "zxccat" (zxc -dc): symlinks to zxc, POSIX only, as in CMake.
+  # "unzxc" (zxc -d) and "zxccat" (zxc -dc): symlinks to zxc and to its man
+  # page, as in CMake. Symbolic links and man pages are POSIX-only.
   if host_machine.system() != 'windows'
+    install_man('src/cli/zxc.1')
     foreach alias : ['unzxc', 'zxccat']
       install_symlink(alias,
         pointing_to : 'zxc',
         install_dir : get_option('bindir'),
+      )
+      install_symlink(alias + '.1',
+        pointing_to : 'zxc.1',
+        install_dir : get_option('mandir') / 'man1',
+        install_tag : 'man',
       )
     endforeach
   endif
