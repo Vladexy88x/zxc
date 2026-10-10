@@ -66,7 +66,7 @@ func CompressTo(data []byte, output []byte, opts ...Option) (int, error) {
 	}
 
 	// &data[0] panics on an empty slice; pass a valid non-nil pointer instead
-	// (the C side reads 0 bytes) so empty input yields a minimal 32-byte frame.
+	// (the C side reads 0 bytes) so empty input yields a minimal frame.
 	var dummy [1]byte
 	srcPtr := unsafe.Pointer(&dummy[0])
 	if len(data) > 0 {
