@@ -1230,6 +1230,22 @@ if ln -sf "$ZXC_ABS" "$UNZXC_BIN" 2>/dev/null && [[ -L "$UNZXC_BIN" ]]; then
     else
         log_fail "zxccat output differs from the concatenated inputs (rc=$CAT_RC/$CAT_STDIN_RC)"
     fi
+
+    # 26.3b zxccat implies -f: plain files and stdin come out as is
+    cat "$TEST_FILE" "$TEST_DIR/cat_second.txt" > "$TEST_DIR/cat_mixed_expected"
+    set +e
+    "$ZXCCAT_BIN" "$TEST_DIR/alias.zxc" "$TEST_DIR/cat_second.txt" > "$TEST_DIR/cat_mixed" 2>/dev/null
+    CAT_RC=$?
+    "$ZXCCAT_BIN" < "$TEST_DIR/cat_second.txt" > "$TEST_DIR/cat_plain_stdin" 2>/dev/null
+    CAT_STDIN_RC=$?
+    set -e
+    if [[ $CAT_RC -eq 0 && $CAT_STDIN_RC -eq 0 ]] &&
+       cmp -s "$TEST_DIR/cat_mixed_expected" "$TEST_DIR/cat_mixed" &&
+       cmp -s "$TEST_DIR/cat_second.txt" "$TEST_DIR/cat_plain_stdin"; then
+        log_pass "zxccat passes plain files and stdin through"
+    else
+        log_fail "zxccat must pass non-archives through (rc=$CAT_RC/$CAT_STDIN_RC)"
+    fi
 else
     echo "  [SKIP] symlinks unsupported here, skipping unzxc and zxccat alias tests"
 fi
@@ -1244,6 +1260,82 @@ if cmp -s "$TEST_DIR/append_expected" "$TEST_DIR/append_out"; then
 else
     log_fail "-c truncated the file it should append to"
 fi
+
+# 26.5 zxcless pages .zxc files through less, and other files unchanged (POSIX
+#      only: not installed on Windows). Off a terminal, less copies to stdout.
+ZXCLESS="$(dirname "$0")/../src/cli/zxcless"
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) echo "  [SKIP] zxcless is not installed on Windows" ;;
+    *)
+        if command -v less >/dev/null 2>&1; then
+            "$ZXC_BIN" -z -c -k "$TEST_FILE_ARG" > "$TEST_DIR/less.zxc"
+            printf 'plain text\n' > "$TEST_DIR/less_plain.txt"
+            { cat "$TEST_FILE"; cat "$TEST_DIR/less_plain.txt"; } > "$TEST_DIR/less_expected"
+            set +e
+            ZXC="$ZXC_ABS" sh "$ZXCLESS" "$TEST_DIR/less.zxc" "$TEST_DIR/less_plain.txt" \
+                > "$TEST_DIR/less_out" 2>/dev/null
+            set -e
+            if cmp -s "$TEST_DIR/less_expected" "$TEST_DIR/less_out"; then
+                log_pass "zxcless decompresses .zxc files and shows others unchanged"
+            else
+                log_fail "zxcless output differs from the decompressed file"
+            fi
+
+            # Standard input: an archive is decompressed, plain text shown unchanged
+            set +e
+            ZXC="$ZXC_ABS" sh "$ZXCLESS" < "$TEST_DIR/less.zxc" > "$TEST_DIR/less_stdin_zxc" 2>/dev/null
+            ZXC="$ZXC_ABS" sh "$ZXCLESS" < "$TEST_DIR/less_plain.txt" > "$TEST_DIR/less_stdin_plain" 2>/dev/null
+            set -e
+            if cmp -s "$TEST_FILE" "$TEST_DIR/less_stdin_zxc" &&
+               cmp -s "$TEST_DIR/less_plain.txt" "$TEST_DIR/less_stdin_plain"; then
+                log_pass "zxcless decompresses an archive on stdin and shows plain stdin unchanged"
+            else
+                log_fail "zxcless on stdin: archive not decompressed or plain text lost"
+            fi
+
+            # The filter: -f for stdin only, a named plain file is left to less
+            set +e
+            ZXC="$ZXC_ABS" sh "$ZXCLESS" --zxcless-filter - < "$TEST_DIR/less_plain.txt" \
+                > "$TEST_DIR/less_filter_stdin" 2>/dev/null
+            ZXC="$ZXC_ABS" sh "$ZXCLESS" --zxcless-filter "$TEST_DIR/less_plain.txt" \
+                > "$TEST_DIR/less_filter_named" 2>/dev/null < /dev/null
+            set -e
+            if cmp -s "$TEST_DIR/less_plain.txt" "$TEST_DIR/less_filter_stdin" &&
+               [[ ! -s "$TEST_DIR/less_filter_named" ]]; then
+                log_pass "zxcless passes plain stdin through and leaves named files to less"
+            else
+                log_fail "zxcless filter: plain stdin not copied, or a named plain file piped"
+            fi
+
+            # An empty archive shows empty, not as its raw bytes
+            printf '' | "$ZXC_BIN" -z -c > "$TEST_DIR/less_empty.zxc"
+            set +e
+            ZXC="$ZXC_ABS" sh "$ZXCLESS" "$TEST_DIR/less_empty.zxc" \
+                > "$TEST_DIR/less_empty_out" 2>/dev/null < /dev/null
+            set -e
+            if [[ -s "$TEST_DIR/less_empty.zxc" && ! -s "$TEST_DIR/less_empty_out" ]]; then
+                log_pass "zxcless shows an empty archive as empty"
+            else
+                log_fail "zxcless showed the raw bytes of an empty archive"
+            fi
+
+            # A file named like an option is still a file
+            cp "$TEST_DIR/less.zxc" "$TEST_DIR/-k.zxc"
+            ZXCLESS_ABS="$(cd "$(dirname "$ZXCLESS")" && pwd)/zxcless"
+            set +e
+            (cd "$TEST_DIR" && ZXC="$ZXC_ABS" sh "$ZXCLESS_ABS" -- -k.zxc) \
+                > "$TEST_DIR/less_dash_out" 2>/dev/null < /dev/null
+            set -e
+            if cmp -s "$TEST_FILE" "$TEST_DIR/less_dash_out"; then
+                log_pass "zxcless shows a file whose name starts with '-'"
+            else
+                log_fail "zxcless passed a file named '-k.zxc' to zxc as an option"
+            fi
+        else
+            echo "  [SKIP] less is not installed"
+        fi
+        ;;
+esac
 
 # 27. Multiple input files (-m) and native Windows wildcard expansion (setargv.obj)
 echo "Testing multiple-file mode (-m) and wildcard expansion..."
@@ -1670,6 +1762,60 @@ for w in z d l list t test b; do
     fi
 done
 log_pass "Files named like modes compress and decompress"
+
+# 37. -dcf passes through input that is not an archive
+echo "Testing -dcf pass-through..."
+printf 'plain text, not an archive\n' > "$TEST_DIR/pass_plain.txt"
+"$ZXC_BIN" -z -c -k "$TEST_FILE_ARG" > "$TEST_DIR/pass.zxc"
+
+# 37.1 Plain input, from a file or stdin, comes out as is; without -f it is refused
+set +e
+"$ZXC_BIN" -dcf "$TEST_DIR/pass_plain.txt" > "$TEST_DIR/pass_file_out" 2>/dev/null
+RC_FILE=$?
+"$ZXC_BIN" -dcf < "$TEST_DIR/pass_plain.txt" > "$TEST_DIR/pass_stdin_out" 2>/dev/null
+RC_STDIN=$?
+"$ZXC_BIN" -dc < "$TEST_DIR/pass_plain.txt" > /dev/null 2>&1
+RC_NOF=$?
+set -e
+if [[ $RC_FILE -eq 0 && $RC_STDIN -eq 0 && $RC_NOF -ne 0 ]] &&
+   cmp -s "$TEST_DIR/pass_plain.txt" "$TEST_DIR/pass_file_out" &&
+   cmp -s "$TEST_DIR/pass_plain.txt" "$TEST_DIR/pass_stdin_out"; then
+    log_pass "-dcf copies plain input unchanged; -dc without -f rejects it"
+else
+    log_fail "-dcf pass-through failed (rc=$RC_FILE/$RC_STDIN, without -f: $RC_NOF)"
+fi
+
+# 37.2 An archive on stdin still decodes after the peek
+if "$ZXC_BIN" -dcf < "$TEST_DIR/pass.zxc" 2>/dev/null | cmp -s - "$TEST_FILE"; then
+    log_pass "-dcf decodes an archive read from stdin"
+else
+    log_fail "-dcf lost the start of an archive read from stdin"
+fi
+
+# 37.3 Empty stdin gives empty output and success
+set +e
+"$ZXC_BIN" -dcf < /dev/null > "$TEST_DIR/pass_empty_out" 2>/dev/null
+RC=$?
+set -e
+if [[ $RC -eq 0 && ! -s "$TEST_DIR/pass_empty_out" ]]; then
+    log_pass "-dcf on empty stdin writes nothing and succeeds"
+else
+    log_fail "-dcf on empty stdin must write nothing and succeed (rc=$RC)"
+fi
+
+# 37.4 A named file needs the whole magic word; stdin only its first byte (0xF5)
+printf '\365not an archive\n' > "$TEST_DIR/pass_f5.bin"
+set +e
+"$ZXC_BIN" -dcf "$TEST_DIR/pass_f5.bin" > "$TEST_DIR/pass_f5_out" 2>/dev/null
+RC_FILE=$?
+"$ZXC_BIN" -dcf < "$TEST_DIR/pass_f5.bin" > /dev/null 2>&1
+RC_STDIN=$?
+set -e
+if [[ $RC_FILE -eq 0 && $RC_STDIN -ne 0 ]] && cmp -s "$TEST_DIR/pass_f5.bin" "$TEST_DIR/pass_f5_out"; then
+    log_pass "-dcf checks the whole magic word in a file, its first byte on stdin"
+else
+    log_fail "-dcf on input starting with 0xF5: file rc=$RC_FILE (want 0), stdin rc=$RC_STDIN (want != 0)"
+fi
 
 echo "All tests passed!"
 exit 0
