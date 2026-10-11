@@ -14,7 +14,7 @@ def build_payload(size):
 
 
 def build_seekable_archive(payload, level=zxc.LEVEL_DEFAULT):
-    return zxc.compress(payload, level=level, checksum=True)
+    return zxc.compress(payload, level=level, checksum=True, seekable=True)
 
 
 def build_seekable_archive_stream(payload, tmp_path, level=zxc.LEVEL_DEFAULT):
@@ -98,6 +98,58 @@ class TestDecompressRange:
             compressed = build_seekable_archive_stream(payload, tmp_path, level=level)
             with zxc.Seekable(compressed) as s:
                 assert s.decompress_range(0, len(payload)) == payload
+
+
+# =========================================================================
+# Buffer API (compress / Cctx)
+# =========================================================================
+
+
+class TestBufferSeekable:
+    # Spans several default-size (512 KiB) blocks.
+    SIZE = 1536 * 1024 + 123
+
+    @pytest.mark.parametrize("seekable", [False, True])
+    def test_compress_flag(self, seekable):
+        payload = build_payload(4096)
+        compressed = zxc.compress(payload, seekable=seekable)
+        assert zxc.get_frame_info(compressed).has_seek_table == seekable
+        assert zxc.decompress(compressed) == payload
+
+    @pytest.mark.parametrize("seekable", [False, True])
+    def test_cctx_flag(self, seekable):
+        payload = build_payload(4096)
+        with zxc.Cctx(seekable=seekable) as cctx:
+            # Twice: the setting must hold for every call on the context.
+            for _ in range(2):
+                compressed = cctx.compress(payload)
+                assert zxc.get_frame_info(compressed).has_seek_table == seekable
+                assert zxc.decompress(compressed) == payload
+
+    def test_compress_range(self):
+        payload = build_payload(self.SIZE)
+        compressed = build_seekable_archive(payload)
+        with zxc.Seekable(compressed) as s:
+            assert s.num_blocks > 1
+            assert s.decompressed_size == len(payload)
+            off, length = 512 * 1024 - 100, 4096
+            assert s.decompress_range(off, length) == payload[off : off + length]
+
+    def test_cctx_range(self):
+        payload = build_payload(self.SIZE)
+        with zxc.Cctx(checksum=True, seekable=True) as cctx:
+            compressed = cctx.compress(payload)
+        with zxc.Seekable(compressed) as s:
+            assert s.num_blocks > 1
+            off, length = 1024 * 1024 + 7, 300 * 1024
+            assert s.decompress_range(off, length) == payload[off : off + length]
+
+    def test_compress_empty(self):
+        compressed = zxc.compress(b"", seekable=True)
+        assert zxc.get_frame_info(compressed).has_seek_table
+        assert zxc.decompress(compressed) == b""
+        with zxc.Seekable(compressed) as s:
+            assert s.decompressed_size == 0
 
 
 # =========================================================================

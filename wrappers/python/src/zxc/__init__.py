@@ -308,7 +308,12 @@ def _split_dict_arg(dict, dict_huf):
 
 
 def compress(
-    data, level=LEVEL_DEFAULT, checksum=False, dict=None, dict_huf=None
+    data,
+    level=LEVEL_DEFAULT,
+    checksum=False,
+    dict=None,
+    dict_huf=None,
+    seekable=False,
 ) -> bytes:
     """Compress a bytes object.
 
@@ -322,6 +327,8 @@ def compress(
         dict_huf: Optional shared literal Huffman table (128 bytes, from
             `train_dict_huf` or `dict_huf`). Ignored without `dict`; becomes
             part of the archive's dictionary binding.
+        seekable: If True, append a seek table for random-access decompression
+            with `Seekable`.
 
     Returns:
         Compressed bytes.
@@ -330,7 +337,7 @@ def compress(
         This function operates entirely in-memory. For streaming files, use `stream_compress`.
     """
     dict, dict_huf = _split_dict_arg(dict, dict_huf)
-    return pyzxc_compress(data, level, checksum, dict, dict_huf)
+    return pyzxc_compress(data, level, checksum, dict, dict_huf, seekable)
 
 
 def get_decompressed_size(data: bytes) -> int:
@@ -610,7 +617,7 @@ def write_seek_table(comp_sizes: list) -> bytes:
     """Write a raw seek table from a list of per-block compressed sizes.
 
     Low-level helper — most callers should simply pass ``seekable=True`` to
-    :func:`stream_compress` instead.
+    :func:`compress`, :class:`Cctx` or :func:`stream_compress` instead.
     """
     return pyzxc_write_seek_table(comp_sizes)
 
@@ -620,7 +627,7 @@ class Cctx:
 
     The Python counterpart of the C ``zxc_cctx``: one archive per
     :meth:`compress` call, with the working buffers carved once. A dictionary
-    given here applies to every call. Not thread-safe.
+    or ``seekable=True`` given here applies to every call. Not thread-safe.
 
     Example::
 
@@ -636,9 +643,10 @@ class Cctx:
         checksum: bool = False,
         dict=None,
         dict_huf=None,
+        seekable: bool = False,
     ):
         dict, dict_huf = _split_dict_arg(dict, dict_huf)
-        self._handle = pyzxc_cctx_create(level, checksum, dict, dict_huf)
+        self._handle = pyzxc_cctx_create(level, checksum, dict, dict_huf, seekable)
 
     def compress(self, data) -> bytes:
         """Compress *data* into a complete archive."""

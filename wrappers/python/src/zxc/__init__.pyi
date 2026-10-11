@@ -57,6 +57,7 @@ def compress(
     checksum: bool = False,
     dict: Optional[bytes] = None,
     dict_huf: Optional[bytes] = None,
+    seekable: bool = False,
 ) -> bytes: ...
 def decompress(
     data: bytes,
@@ -151,6 +152,7 @@ class Cctx:
         checksum: bool = False,
         dict: "Dictionary | bytes | None" = None,
         dict_huf: bytes | None = None,
+        seekable: bool = False,
     ) -> None: ...
     def compress(self, data: bytes) -> bytes: ...
     def close(self) -> None: ...
