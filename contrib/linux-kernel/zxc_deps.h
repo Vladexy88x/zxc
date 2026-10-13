@@ -9,6 +9,7 @@
 #define ZXC_DEPS_H
 
 #include <linux/bitops.h>
+#include <linux/build_bug.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/mm.h>
@@ -17,6 +18,11 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
+
+// <linux/build_bug.h> spells static_assert from 5.1 only; the module builds as gnu11.
+#ifndef static_assert
+#define static_assert(expr, msg) _Static_assert(expr, msg)
+#endif
 
 // zxc spells these the libc way; the kernel ships U*_MAX.
 #ifndef CHAR_BIT
