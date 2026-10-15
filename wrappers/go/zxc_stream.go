@@ -24,7 +24,9 @@ import (
 // loops, callback-driven libraries, or non-blocking network protocols where
 // the [CompressFile] FILE*-based pipeline is not appropriate.
 //
-// CStream is not safe for concurrent use; one goroutine per stream.
+// CStream is not safe for concurrent use; one goroutine per stream. Always
+// defer a call to [CStream.Close]; a finalizer frees a dropped stream only
+// once the garbage collector runs.
 type CStream struct {
 	ptr *C.zxc_cstream
 }
@@ -50,7 +52,9 @@ func NewCStream(opts ...Option) (*CStream, error) {
 	if ptr == nil {
 		return nil, ErrMemory
 	}
-	return &CStream{ptr: ptr}, nil
+	c := &CStream{ptr: ptr}
+	runtime.SetFinalizer(c, (*CStream).Close)
+	return c, nil
 }
 
 // Close releases the stream and all internal buffers. Safe to call multiple
@@ -61,6 +65,7 @@ func (c *CStream) Close() error {
 	}
 	C.zxc_cstream_free(c.ptr)
 	c.ptr = nil
+	runtime.SetFinalizer(c, nil)
 	return nil
 }
 
@@ -69,7 +74,9 @@ func (c *CStream) InSize() int {
 	if c == nil || c.ptr == nil {
 		return 0
 	}
-	return int(C.zxc_cstream_in_size(c.ptr))
+	n := int(C.zxc_cstream_in_size(c.ptr))
+	runtime.KeepAlive(c)
+	return n
 }
 
 // OutSize returns the suggested output chunk size to never trigger a partial
@@ -78,7 +85,9 @@ func (c *CStream) OutSize() int {
 	if c == nil || c.ptr == nil {
 		return 0
 	}
-	return int(C.zxc_cstream_out_size(c.ptr))
+	n := int(C.zxc_cstream_out_size(c.ptr))
+	runtime.KeepAlive(c)
+	return n
 }
 
 // Compress pushes bytes from in into the stream and writes compressed bytes
@@ -115,6 +124,7 @@ func (c *CStream) Compress(out, in []byte) (consumed, produced int, pending int6
 	outBuf.size = C.size_t(len(out))
 
 	r := C.zxc_cstream_compress(c.ptr, &outBuf, &inBuf)
+	runtime.KeepAlive(c)
 	if r < 0 {
 		return 0, 0, 0, errorFromCode(r)
 	}
@@ -144,6 +154,7 @@ func (c *CStream) End(out []byte) (produced int, pending int64, err error) {
 	outBuf.size = C.size_t(len(out))
 
 	r := C.zxc_cstream_end(c.ptr, &outBuf)
+	runtime.KeepAlive(c)
 	if r < 0 {
 		return 0, 0, errorFromCode(r)
 	}
@@ -151,7 +162,8 @@ func (c *CStream) End(out []byte) (produced int, pending int64, err error) {
 }
 
 // DStream is a push-based, single-threaded decompression stream — the Go
-// counterpart of the C [zxc_dstream].
+// counterpart of the C [zxc_dstream]. Always defer a call to
+// [DStream.Close]; as with [CStream], a finalizer is only a safety net.
 type DStream struct {
 	ptr *C.zxc_dstream
 }
@@ -173,7 +185,9 @@ func NewDStream(opts ...Option) (*DStream, error) {
 	if ptr == nil {
 		return nil, ErrMemory
 	}
-	return &DStream{ptr: ptr}, nil
+	d := &DStream{ptr: ptr}
+	runtime.SetFinalizer(d, (*DStream).Close)
+	return d, nil
 }
 
 // Close releases the stream and all internal buffers. Safe to call multiple
@@ -184,6 +198,7 @@ func (d *DStream) Close() error {
 	}
 	C.zxc_dstream_free(d.ptr)
 	d.ptr = nil
+	runtime.SetFinalizer(d, nil)
 	return nil
 }
 
@@ -192,7 +207,9 @@ func (d *DStream) InSize() int {
 	if d == nil || d.ptr == nil {
 		return 0
 	}
-	return int(C.zxc_dstream_in_size(d.ptr))
+	n := int(C.zxc_dstream_in_size(d.ptr))
+	runtime.KeepAlive(d)
+	return n
 }
 
 // OutSize returns the suggested output chunk size for the decompressor.
@@ -200,7 +217,9 @@ func (d *DStream) OutSize() int {
 	if d == nil || d.ptr == nil {
 		return 0
 	}
-	return int(C.zxc_dstream_out_size(d.ptr))
+	n := int(C.zxc_dstream_out_size(d.ptr))
+	runtime.KeepAlive(d)
+	return n
 }
 
 // Finished reports whether the input so far ends on a validated footer; more
@@ -211,7 +230,9 @@ func (d *DStream) Finished() bool {
 	if d == nil || d.ptr == nil {
 		return false
 	}
-	return C.zxc_dstream_finished(d.ptr) != 0
+	done := C.zxc_dstream_finished(d.ptr) != 0
+	runtime.KeepAlive(d)
+	return done
 }
 
 // Decompress pushes compressed bytes from in into the stream and writes
@@ -247,6 +268,7 @@ func (d *DStream) Decompress(out, in []byte) (consumed, produced int, err error)
 	outBuf.size = C.size_t(len(out))
 
 	r := C.zxc_dstream_decompress(d.ptr, &outBuf, &inBuf)
+	runtime.KeepAlive(d)
 	if r < 0 {
 		return 0, 0, errorFromCode(r)
 	}

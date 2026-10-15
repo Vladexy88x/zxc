@@ -62,6 +62,8 @@ func EstimateCctxSize(srcSize, level int) uint64 {
 //
 // It wraps an opaque C handle that is freed by [Cctx.Close]. Create with
 // [NewCctx] and always defer a call to Close to release the native memory.
+// A context dropped without Close is freed by a finalizer, but only once the
+// garbage collector runs, which native memory alone never triggers.
 type Cctx struct {
 	ptr *C.zxc_cctx
 
@@ -94,7 +96,9 @@ func NewCctx(opts ...Option) (*Cctx, error) {
 	if ptr == nil {
 		return nil, ErrMemory
 	}
-	return &Cctx{ptr: ptr, level: o.level, checksum: o.checksum, dict: o.dict, dictHuf: o.dictHuf}, nil
+	c := &Cctx{ptr: ptr, level: o.level, checksum: o.checksum, dict: o.dict, dictHuf: o.dictHuf}
+	runtime.SetFinalizer(c, (*Cctx).Close)
+	return c, nil
 }
 
 // Close releases the native resources held by the context. Safe to call
@@ -105,6 +109,7 @@ func (c *Cctx) Close() error {
 	}
 	C.zxc_free_cctx(c.ptr)
 	c.ptr = nil
+	runtime.SetFinalizer(c, nil)
 	return nil
 }
 
@@ -162,13 +167,15 @@ func (c *Cctx) CompressBlock(src, dst []byte, opts ...Option) (int, error) {
 		C.size_t(len(dst)),
 		&copts,
 	)
+	runtime.KeepAlive(c)
 	if n < 0 {
 		return 0, errorFromCode(n)
 	}
 	return int(n), nil
 }
 
-// Dctx is a reusable decompression context for the Block API.
+// Dctx is a reusable decompression context for the Block API. Always defer a
+// call to [Dctx.Close]; as with [Cctx], a finalizer is only a safety net.
 type Dctx struct {
 	ptr *C.zxc_dctx
 
@@ -190,7 +197,9 @@ func NewDctx(opts ...Option) (*Dctx, error) {
 	if ptr == nil {
 		return nil, ErrMemory
 	}
-	return &Dctx{ptr: ptr, dict: o.dict, dictHuf: o.dictHuf}, nil
+	d := &Dctx{ptr: ptr, dict: o.dict, dictHuf: o.dictHuf}
+	runtime.SetFinalizer(d, (*Dctx).Close)
+	return d, nil
 }
 
 // mergeDict fills in the creation-time dictionary where a call omits it.
@@ -210,6 +219,7 @@ func (d *Dctx) Close() error {
 	}
 	C.zxc_free_dctx(d.ptr)
 	d.ptr = nil
+	runtime.SetFinalizer(d, nil)
 	return nil
 }
 
@@ -252,6 +262,7 @@ func (d *Dctx) DecompressBlock(src, dst []byte, opts ...Option) (int, error) {
 		C.size_t(len(dst)),
 		&dopts,
 	)
+	runtime.KeepAlive(d)
 	if n < 0 {
 		return 0, errorFromCode(n)
 	}
@@ -294,6 +305,7 @@ func (d *Dctx) DecompressBlockSafe(src, dst []byte, opts ...Option) (int, error)
 		C.size_t(len(dst)),
 		&dopts,
 	)
+	runtime.KeepAlive(d)
 	if n < 0 {
 		return 0, errorFromCode(n)
 	}
