@@ -10,7 +10,6 @@
 # Manifests: consumed by `sha256sum -c`.
 *.sha256   text eol=lf
 
-# Kept out of `git archive` and GitHub's source tarballs
-/.github   export-ignore
+# Kept out of `git archive` and GitHub's source tarballs.
 /site      export-ignore
 /wrappers  export-ignore
