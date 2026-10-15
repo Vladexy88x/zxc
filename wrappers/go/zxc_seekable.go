@@ -43,7 +43,10 @@ import (
 // Seekable is a handle to a seekable ZXC archive.
 //
 // Build one with [Open] (file-backed) or [OpenBytes] (in-memory). Always
-// defer a call to [Seekable.Close] to release the native resources.
+// defer a call to [Seekable.Close] to release the native resources. A handle
+// dropped without Close is released by a finalizer once the garbage collector
+// runs; until then it keeps its file open (locked, on Windows), its source
+// pinned and its reader reachable.
 //
 // A Seekable handle is single-threaded: callers must not invoke its methods
 // from more than one goroutine concurrently. From ReadAt, Close, SetDict and a
@@ -84,7 +87,9 @@ func Open(path string) (*Seekable, error) {
 		C.fclose(f)
 		return nil, ErrInvalidData
 	}
-	return &Seekable{ptr: ptr, file: f}, nil
+	s := &Seekable{ptr: ptr, file: f}
+	runtime.SetFinalizer(s, (*Seekable).Close)
+	return s, nil
 }
 
 // OpenBytes opens a seekable archive from an in-memory buffer.
@@ -110,6 +115,9 @@ func OpenBytes(data []byte) (*Seekable, error) {
 	}
 	s.ptr = ptr
 	s.srcData = data
+	// The Seekable references its Pinner, so this finalizer runs (and unpins)
+	// before the Pinner's own, which panics on a pinner collected while pinned.
+	runtime.SetFinalizer(s, (*Seekable).Close)
 	return s, nil
 }
 
@@ -143,7 +151,9 @@ func OpenReader(r io.ReaderAt, size int64) (*Seekable, error) {
 		rc.repanic()
 		return nil, ErrInvalidData
 	}
-	return &Seekable{ptr: ptr, rhandle: h, rctx: rc, hasRH: true}, nil
+	s := &Seekable{ptr: ptr, rhandle: h, rctx: rc, hasRH: true}
+	runtime.SetFinalizer(s, (*Seekable).Close)
+	return s, nil
 }
 
 // seekReader is the value behind a reader-backed handle's cgo.Handle. A panic
@@ -199,6 +209,7 @@ func (s *Seekable) Close() error {
 		s.rctx = nil
 		s.hasRH = false
 	}
+	runtime.SetFinalizer(s, nil)
 	return nil
 }
 
@@ -211,7 +222,9 @@ func (s *Seekable) NumBlocks() uint64 {
 	if s == nil || s.ptr == nil {
 		return 0
 	}
-	return uint64(C.zxc_seekable_get_num_blocks(s.ptr))
+	n := uint64(C.zxc_seekable_get_num_blocks(s.ptr))
+	runtime.KeepAlive(s)
+	return n
 }
 
 // DecompressedSize returns the total decompressed size of the archive in
@@ -220,7 +233,9 @@ func (s *Seekable) DecompressedSize() uint64 {
 	if s == nil || s.ptr == nil {
 		return 0
 	}
-	return uint64(C.zxc_seekable_get_decompressed_size(s.ptr))
+	n := uint64(C.zxc_seekable_get_decompressed_size(s.ptr))
+	runtime.KeepAlive(s)
+	return n
 }
 
 // BlockCompressedSize returns the on-disk size of a specific block (block
@@ -250,7 +265,9 @@ func (s *Seekable) BlockDecompressedSize(blockIdx uint64) (uint32, bool) {
 	if s == nil || s.ptr == nil || blockIdx >= s.NumBlocks() {
 		return 0, false
 	}
-	return uint32(C.zxc_seekable_get_block_decomp_size(s.ptr, C.uint64_t(blockIdx))), true
+	n := uint32(C.zxc_seekable_get_block_decomp_size(s.ptr, C.uint64_t(blockIdx)))
+	runtime.KeepAlive(s)
+	return n, true
 }
 
 // DecompressRange decompresses length bytes starting at offset (in the
@@ -305,7 +322,9 @@ func (s *Seekable) SetChecksum(enabled bool) error {
 	if enabled {
 		on = 1
 	}
-	if rc := C.zxc_seekable_set_checksum(s.ptr, on); rc != C.ZXC_OK {
+	rc := C.zxc_seekable_set_checksum(s.ptr, on)
+	runtime.KeepAlive(s)
+	if rc != C.ZXC_OK {
 		return errorFromCode(C.int64_t(rc))
 	}
 	return nil
@@ -351,6 +370,7 @@ func (s *Seekable) SetDict(dict, hufLengths []byte) error {
 		huf = unsafe.Pointer(&hufLengths[0])
 	}
 	rc := C.zxc_seekable_set_dict(s.ptr, unsafe.Pointer(&dict[0]), C.size_t(len(dict)), huf)
+	runtime.KeepAlive(s)
 	if rc < 0 {
 		return errorFromCode(C.int64_t(rc))
 	}

@@ -46,6 +46,8 @@ func DetectZxc(data []byte) bool {
 //
 // The caller MUST call [Writer.Close] to flush the residual block, EOF marker
 // and footer; closing the underlying writer is the caller's responsibility.
+// A Writer dropped without Close has its native memory freed by a finalizer,
+// but the output it wrote is truncated: no finalizer can complete the frame.
 //
 // Writer is not safe for concurrent use.
 type Writer struct {
