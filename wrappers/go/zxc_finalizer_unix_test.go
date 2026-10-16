@@ -3,6 +3,8 @@
 //
 // Copyright (c) Bertrand Lebonnois and contributors.
 
+//go:build unix
+
 package zxc
 
 import (
@@ -12,7 +14,8 @@ import (
 )
 
 // committedBytes returns the process's data segment (VmData). Resident memory
-// would miss a leak: the library reserves buffers it may never touch.
+// would miss a leak: the library reserves buffers it may never touch. Outside
+// Linux there is no portable source, so the memory test skips.
 func committedBytes() (int64, bool) {
 	b, err := os.ReadFile("/proc/self/status")
 	if err != nil {
@@ -28,6 +31,10 @@ func committedBytes() (int64, bool) {
 }
 
 func openHandles() (int, bool) {
-	e, err := os.ReadDir("/proc/self/fd")
-	return len(e), err == nil
+	for _, dir := range []string{"/proc/self/fd", "/dev/fd"} {
+		if e, err := os.ReadDir(dir); err == nil {
+			return len(e), true
+		}
+	}
+	return 0, false
 }
