@@ -373,7 +373,7 @@ ZXC_EXPORT uint64_t zxc_decompress_block_bound(const size_t uncompressed_size);
  * @param[in]     src_size     Source size in bytes, in [1, @ref ZXC_BLOCK_SIZE_MAX].
  * @param[out]    dst          Destination buffer.
  * @param[in]     dst_capacity Capacity of @p dst (see zxc_compress_block_bound()).
- * @param[in]     opts         Compression options, or NULL for defaults.
+ * @param[in]     opts         Options, or NULL to reuse the sticky settings.
  *                             @c level, @c block_size, @c checksum_enabled and
  *                             the dictionary fields are used; the shared table
  *                             is rebuilt only when it changes. @c seekable is
@@ -383,7 +383,8 @@ ZXC_EXPORT uint64_t zxc_decompress_block_bound(const size_t uncompressed_size);
  *
  * @return Compressed block size (> 0), or a negative @ref zxc_error_t.
  *         @ref ZXC_ERROR_BAD_BLOCK_SIZE if @p src_size exceeds
- *         @ref ZXC_BLOCK_SIZE_MAX; @ref ZXC_ERROR_BAD_LEVEL on a static
+ *         @ref ZXC_BLOCK_SIZE_MAX or @c block_size is not a power of two in
+ *         range; @ref ZXC_ERROR_BAD_LEVEL on a static
  *         context for a level raise its workspace cannot accommodate (levels
  *         above @ref ZXC_LEVEL_ULTRA are otherwise silently clamped);
  *         @ref ZXC_ERROR_DICT_UNSUPPORTED on a static context with a dictionary.
@@ -535,10 +536,13 @@ ZXC_EXPORT void zxc_free_cctx(zxc_cctx* cctx);
  * raise returns @ref ZXC_ERROR_BAD_LEVEL instead, since the workspace cannot
  * grow.
  *
- * Options are **sticky**: each entry point remembers the options it uses for
- * later calls that pass NULL, starting from zxc_create_cctx(): level,
- * block_size, checksum_enabled and seekable here, the first three for
- * zxc_compress_block(). Levels above @ref ZXC_LEVEL_ULTRA are silently clamped.
+ * Options are **sticky**: NULL @p opts reuses the last successful call's level,
+ * block_size, checksum_enabled and seekable (the first three for
+ * zxc_compress_block()), starting from zxc_create_cctx(). In a non-NULL
+ * @p opts, a zero level or block_size means the creation value (the library
+ * default for a NULL zxc_create_cctx()), never an earlier call's. A failed call
+ * leaves them untouched, workspace re-carving aside. Levels above
+ * @ref ZXC_LEVEL_ULTRA are silently clamped.
  * Dictionary options are the exception: honoured as in zxc_compress() but
  * never remembered, so pass them on every call; the shared table is rebuilt
  * only when it changes. A static context returns
@@ -709,10 +713,11 @@ ZXC_EXPORT size_t zxc_static_cctx_workspace_size(const size_t block_size, const 
  * @par Locked parameters
  * @c block_size, @c level and @c checksum_enabled are pinned at init time. A
  * later @ref zxc_compress_cctx call asking for a different @c block_size
- * returns @ref ZXC_ERROR_BAD_BLOCK_SIZE without re-initialising. A different
- * @c level / @c checksum_enabled is honoured per call without re-partitioning,
- * except a raise into @ref ZXC_LEVEL_DENSITY on a workspace carved below it:
- * the optimal-parser scratch is absent, so the call returns
+ * returns @ref ZXC_ERROR_BAD_BLOCK_SIZE without re-initialising; a zero
+ * @c block_size or @c level means the pinned one. A different @c level /
+ * @c checksum_enabled is honoured per call without re-partitioning, except a
+ * raise into @ref ZXC_LEVEL_DENSITY on a workspace carved below it: the
+ * optimal-parser scratch is absent, so the call returns
  * @ref ZXC_ERROR_BAD_LEVEL. Dictionaries are rejected too:
  * @ref ZXC_ERROR_DICT_UNSUPPORTED.
  *

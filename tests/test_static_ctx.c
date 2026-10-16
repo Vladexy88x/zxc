@@ -209,14 +209,14 @@ int test_static_ctx_block_size_locked(void) {
     printf("=== TEST: Static Context API - block_size lock ===\n");
 
     const size_t pinned_bs = 64 * 1024;
-    const size_t ws_sz = zxc_static_cctx_workspace_size(pinned_bs, ZXC_LEVEL_DEFAULT);
+    const size_t ws_sz = zxc_static_cctx_workspace_size(pinned_bs, ZXC_LEVEL_DENSITY);
     void* const ws = test_aligned_alloc(64, ws_sz);
     if (!ws) {
         printf("  [FAIL] aligned_alloc\n");
         return 0;
     }
 
-    zxc_compress_opts_t opts = {.level = ZXC_LEVEL_DEFAULT, .block_size = pinned_bs};
+    zxc_compress_opts_t opts = {.level = ZXC_LEVEL_DENSITY, .block_size = pinned_bs};
     zxc_cctx* const cctx = zxc_init_static_cctx(ws, ws_sz, &opts);
     if (!cctx) {
         printf("  [FAIL] init_static_cctx\n");
@@ -240,6 +240,27 @@ int test_static_ctx_block_size_locked(void) {
     const int64_t rc2 = zxc_compress_cctx(cctx, src, sizeof(src), dst, sizeof(dst), NULL);
     if (rc2 <= 0) {
         printf("  [FAIL] same-block_size compress returned %lld\n", (long long)rc2);
+        zxc_free_cctx(cctx);
+        test_aligned_free(ws);
+        return 0;
+    }
+
+    /* Zero fields mean the pinned values, not the last call's (#532): level 3
+     * first, so the two differ. */
+    uint8_t ref[1024];
+    const zxc_compress_opts_t lvl3 = {.level = 3, .block_size = pinned_bs};
+    if (zxc_compress_cctx(cctx, src, sizeof(src), dst, sizeof(dst), &lvl3) <= 0) {
+        printf("  [FAIL] level-3 call on the pinned context\n");
+        zxc_free_cctx(cctx);
+        test_aligned_free(ws);
+        return 0;
+    }
+    const zxc_compress_opts_t zero = {0};
+    const int64_t rc3 = zxc_compress_cctx(cctx, src, sizeof(src), dst, sizeof(dst), &zero);
+    const int64_t rc4 = zxc_compress(src, sizeof(src), ref, sizeof(ref), &opts);
+    if (rc3 <= 0 || rc3 != rc4 || memcmp(dst, ref, (size_t)rc3) != 0) {
+        printf("  [FAIL] zero opts on a pinned context: %lld, one-shot %lld\n", (long long)rc3,
+               (long long)rc4);
         zxc_free_cctx(cctx);
         test_aligned_free(ws);
         return 0;

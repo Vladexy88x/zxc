@@ -653,7 +653,7 @@ ZXC_EXPORT int64_t zxc_compress_block(
     size_t                     src_size,
     void*                      dst,
     size_t                     dst_capacity,
-    const zxc_compress_opts_t* opts       // NULL = defaults
+    const zxc_compress_opts_t* opts       // NULL = sticky settings
 );
 ```
 
@@ -669,7 +669,8 @@ use the frame API (`zxc_compress`) or streaming API (`zxc_cstream_*`), which
 chunk transparently into format-conformant blocks.
 
 **Returns**: compressed block size (> 0) on success, or negative `zxc_error_t`.
-Returns `ZXC_ERROR_BAD_BLOCK_SIZE` if `src_size > ZXC_BLOCK_SIZE_MAX`.
+Returns `ZXC_ERROR_BAD_BLOCK_SIZE` if `src_size > ZXC_BLOCK_SIZE_MAX`, or if
+`block_size` is not a power of two in range.
 
 ### `zxc_decompress_block`
 
@@ -776,7 +777,9 @@ ZXC_EXPORT zxc_cctx* zxc_create_cctx(const zxc_compress_opts_t* opts);
 
 Creates a heap-allocated compression context.  
 When `opts` is non-NULL, internal buffers are pre-allocated (eager init).  
-When `opts` is NULL, allocation is deferred to first use (lazy init).
+When `opts` is NULL, allocation is deferred to first use (lazy init).  
+The creation options are also what a zero `level` or `block_size` in a later
+call falls back to (the library defaults for NULL).
 
 **Returns**: context pointer, or `NULL` on allocation failure.
 
@@ -802,7 +805,8 @@ ZXC_EXPORT int64_t zxc_compress_cctx(
 ```
 
 Same as `zxc_compress()` but reuses internal buffers from `cctx`.
-Automatically re-initializes when `block_size` or `level` changes. A zero
+The workspace is re-carved when the block size changes, or when a level raise
+into `ZXC_LEVEL_DENSITY` needs the optimal-parser scratch. A zero
 `src_size` writes the empty archive, as `zxc_compress()` does, without carving
 the workspace. Dictionary options are honoured as in `zxc_compress()` but are
 not sticky; the shared literal table is rebuilt only when it changes. A static
@@ -810,9 +814,11 @@ context returns `ZXC_ERROR_DICT_UNSUPPORTED` for any dictionary. `seekable`
 appends the seek table as `zxc_compress()` does, without allocating, static
 contexts included.
 
-Each entry point remembers the options it uses: `level`, `block_size`,
-`checksum_enabled` and `seekable` here, the first three for
-`zxc_compress_block()`.
+Options are **sticky**: `NULL` reuses the last successful call's `level`,
+`block_size`, `checksum_enabled` and `seekable` (the first three for
+`zxc_compress_block()`), starting from the creation options. A zero `level` or
+`block_size` in a non-NULL `opts` means the value the context was created
+with, never an earlier call's. A failed call leaves them untouched.
 
 ### `zxc_create_dctx`
 
