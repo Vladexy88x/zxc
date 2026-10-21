@@ -406,7 +406,7 @@ Two byte-frozen suites guard the format:
 Licensed under the **BSD 3-Clause License**. See LICENSE for details.
 
 **Third-Party Components:**
-- **[rapidhash](https://github.com/Nicoshev/rapidhash)** by Nicolas De Carli (MIT) - Used for high-speed, platform-independent checksums.
+- **[rapidhash](https://github.com/Nicoshev/rapidhash)** by [Nicolas De Carli](https://github.com/Nicoshev) (MIT) - Used for high-speed, platform-independent checksums.
 
 **Acknowledgements:**
-- **[PivCo-Huffman](https://github.com/MarcinZukowski/pivco-huffman)** (PIVoted COding) by Marcin Żukowski - the level-ordered layout and merge-based decode of ZXC's Huffman sections follow its design; implemented independently here. Special thanks to Dougall Johnson, whose idea of jointly nudging flat and length codes is behind the level 6 / 7 decode speedups.
+- **[PivCo-Huffman](https://github.com/MarcinZukowski/pivco-huffman)** (PIVoted COding) by [Marcin Żukowski](https://github.com/MarcinZukowski) - the level-ordered layout and merge-based decode of ZXC's Huffman sections follow its design; implemented independently here. Special thanks to [Dougall Johnson](https://github.com/dougallj), whose idea of jointly nudging flat and length codes is behind the level 6 / 7 decode speedups.
