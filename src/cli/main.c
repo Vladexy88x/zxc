@@ -395,6 +395,8 @@ static int g_progress_mode = ZXC_PROGRESS_AUTO;
 /* Shared literal Huffman table from the -D .zxd file (malloc'd copy), passed
  * through the compress/decompress opts. NULL when the dict carries none. */
 static void* g_dict_huf = NULL;
+// --no-preserve clears it
+static int g_preserve = 1;
 
 /* Enables printf-style format/argument checking by the compiler on GCC/Clang
  * (catches format-vs-argument mismatches at every call site); no-op on MSVC. */
@@ -454,7 +456,7 @@ typedef enum {
     MODE_TRAIN_DICT
 } zxc_mode_t;
 
-enum { OPT_VERSION = 1000, OPT_HELP, OPT_TRAIN_DICT, OPT_PROGRESS };
+enum { OPT_VERSION = 1000, OPT_HELP, OPT_TRAIN_DICT, OPT_PROGRESS, OPT_NO_PRESERVE };
 
 // dir + separator + name in a malloc'd string, so no fixed limit; NULL if out of memory.
 static char* zxc_path_join(const char* dir, const char* name) {
@@ -664,6 +666,8 @@ static void print_help(const char* app) {
         "  -o, --output FILE Write output to FILE (else derived from input;\n"
         "                    for --train: ./dictionary_<dict_id>.zxd, or a directory)\n"
         "  -k, --keep        Keep input file\n"
+        "  --no-preserve     Do not copy the input's mode, times and group (owner as\n"
+        "                    root) to the output\n"
         "  -f, --force       Force overwrite; when decompressing to stdout, copy\n"
         "                    non-ZXC input as is\n"
         "  -c, --stdout      Write to stdout\n"
@@ -1161,6 +1165,108 @@ static int zxc_archive_has_checksum(FILE* f) {
     return c.checksummed == 0 ? 0 : c.checksummed == c.frames ? 1 : 2;
 }
 
+/**
+ * @brief Creates the output file at @p path.
+ *
+ * Anything already there fails with EEXIST unless @p force replaces it, so a
+ * link's target, the input or a read-only file is never written through. A
+ * device, FIFO or socket, even behind a link (/dev/stdout), is written as is.
+ *
+ * @param owner_only 1 for 0600, 0 for 0644 (ignored on Windows).
+ * @param[out] special 1 when writing to a device, FIFO or socket.
+ * @return The stream, or NULL with errno set.
+ */
+static FILE* zxc_create_output(const char* path, int force, int owner_only, int* special) {
+    *special = 0;
+#ifdef _WIN32
+    (void)owner_only;
+    if (!force && access(path, F_OK) == 0) {
+        errno = EEXIST;
+        return NULL;
+    }
+    return fopen(path, "wb");
+#else
+    struct stat st;
+    const int exists = lstat(path, &st) == 0;
+    if (exists && !force) {
+        errno = EEXIST;
+        return NULL;
+    }
+    struct stat target;  // stat fails on a dangling link: replaced below
+    *special = exists && stat(path, &target) == 0 && !S_ISREG(target.st_mode);
+    int fd;
+    if (*special) {
+        // No O_TRUNC: the link may have been swapped since, so recheck the fd
+        fd = open(path, O_WRONLY);
+        struct stat opened;
+        if (fd != -1 && (fstat(fd, &opened) != 0 || S_ISREG(opened.st_mode))) {
+            close(fd);
+            errno = EEXIST;
+            return NULL;
+        }
+    } else {
+        if (exists && unlink(path) != 0) return NULL;
+        // O_EXCL: a link planted since is refused, not followed
+        fd = open(path, O_CREAT | O_EXCL | O_WRONLY,
+                  owner_only ? S_IRUSR | S_IWUSR : S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    }
+    if (fd == -1) return NULL;
+    FILE* const f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+#endif
+}
+
+/** @brief Input attributes copied to the output, as gzip and zstd do. */
+typedef struct {
+    int valid;  // 0: input is not a regular file
+#ifdef _WIN32
+    FILETIME atime;
+    FILETIME mtime;
+#else
+    struct stat st;
+#endif
+} zxc_file_attrs_t;
+
+/** @brief Records the attributes of @p f if it is a regular file. */
+static void zxc_get_file_attrs(FILE* f, zxc_file_attrs_t* a) {
+#ifdef _WIN32
+    const HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    a->valid = h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK &&
+               GetFileTime(h, NULL, &a->atime, &a->mtime);
+#else
+    a->valid = fstat(fileno(f), &a->st) == 0 && S_ISREG(a->st.st_mode);
+#endif
+}
+
+/**
+ * @brief Copies recorded attributes to @p f, a flushed output file zxc created.
+ * @return 0, or -1 if the mode or times could not be set (the owner and group
+ *         are best effort).
+ */
+static int zxc_set_file_attrs(FILE* f, const zxc_file_attrs_t* a) {
+#ifdef _WIN32
+    // Times only: no mode bits on Windows
+    const HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    if (h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_DISK) return 0;  // NUL
+    return SetFileTime(h, NULL, &a->atime, &a->mtime) ? 0 : -1;
+#else
+    const int fd = fileno(f);
+    mode_t mode = a->st.st_mode & 0777;  // no setuid, setgid, sticky
+    // Owner needs root; a group not kept loses the group bits
+    if (fchown(fd, a->st.st_uid, a->st.st_gid) != 0 && fchown(fd, (uid_t)-1, a->st.st_gid) != 0)
+        mode &= ~(mode_t)S_IRWXG;
+#ifdef __APPLE__
+    const struct timespec times[2] = {a->st.st_atimespec, a->st.st_mtimespec};
+#else
+    const struct timespec times[2] = {a->st.st_atim, a->st.st_mtim};
+#endif
+    const int rc_mode = fchmod(fd, mode);
+    const int rc_times = futimens(fd, times);
+    return (rc_mode == 0 && rc_times == 0) ? 0 : -1;
+#endif
+}
+
 static int process_single_file(const char* in_path, const char* out_path_override, zxc_mode_t mode,
                                int num_threads, int keep_input, int force, int to_stdout,
                                int checksum_enabled, int level, size_t block_size, int json_output,
@@ -1173,7 +1279,9 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     int use_stdin = 1;
     int use_stdout = 0;
     int created_out_file = 0;
+    int out_special = 0;  // device or FIFO: never unlinked
     int overall_ret = 0;
+    zxc_file_attrs_t in_attrs = {0};
 
     if (in_path && strcmp(in_path, "-") != 0) {
         if (zxc_validate_input_path(in_path, resolved_in_path, sizeof(resolved_in_path)) != 0) {
@@ -1252,34 +1360,18 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
             return 1;
         }
 
-        if (!force && access(resolved_out_path, F_OK) == 0) {
-            zxc_log("Output exists. Use -f to overwrite '%s'.\n", resolved_out_path);
-            if (!use_stdin) fclose(f_in);
-            return 1;
-        }
-
-#ifdef _WIN32
-        f_out = fopen(resolved_out_path, "wb");
-#else
-        // Restrict permissions to 0644
-        const int fd = open(resolved_out_path, O_CREAT | O_WRONLY | O_TRUNC,
-                            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        if (fd == -1) {
-            zxc_log("Error creating output %s: %s\n", resolved_out_path, strerror(errno));
-            if (!use_stdin) fclose(f_in);
-            return 1;
-        }
-        f_out = fdopen(fd, "wb");
-#endif
-
+        if (g_preserve && !use_stdin) zxc_get_file_attrs(f_in, &in_attrs);
+        // Private while written if the input's mode is restored at the end
+        f_out = zxc_create_output(resolved_out_path, force, in_attrs.valid, &out_special);
         if (!f_out) {
-            zxc_log("Error open output %s: %s\n", resolved_out_path, strerror(errno));
+            if (errno == EEXIST && !force)
+                zxc_log("Output exists. Use -f to overwrite '%s'.\n", resolved_out_path);
+            else
+                zxc_log("Error creating output %s: %s\n", resolved_out_path, strerror(errno));
             if (!use_stdin) fclose(f_in);
-#ifndef _WIN32
-            if (fd != -1) close(fd);
-#endif
             return 1;
         }
+        if (out_special) in_attrs.valid = 0;
         created_out_file = 1;
     }
 
@@ -1420,8 +1512,13 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     // stdio defers write errors to flush/close: a failure here means the
     // output is truncated even though the codec reported success
     int write_error = 0;
+    int attrs_lost = 0;
     if (created_out_file) {
-        write_error = (fclose(f_out) != 0);
+        write_error = (fflush(f_out) != 0);
+        // After the last write, which would bump the mtime
+        attrs_lost = !write_error && bytes >= 0 && in_attrs.valid &&
+                     zxc_set_file_attrs(f_out, &in_attrs) != 0;
+        write_error |= (fclose(f_out) != 0);
     } else if (use_stdout) {
         write_error = (fflush(stdout) != 0);
         setvbuf(stdout, NULL, _IONBF, 0);
@@ -1433,7 +1530,7 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
     if (bytes >= 0 && write_error) {
         zxc_log("Error: %s: write failed: %s\n", created_out_file ? resolved_out_path : "<stdout>",
                 strerror(errno));
-        if (created_out_file) unlink(resolved_out_path);
+        if (created_out_file && !out_special) unlink(resolved_out_path);
         return 1;
     }
 
@@ -1475,8 +1572,13 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
         } else {
             zxc_log_v("Processed %lld bytes in %.3fs\n", (long long)bytes, dt);
         }
-        if (!use_stdin && !use_stdout && !keep_input && !out_path_override &&
-            mode != MODE_INTEGRITY)
+        const int remove_input = !use_stdin && !use_stdout && !keep_input && !out_path_override &&
+                                 mode != MODE_INTEGRITY;
+        // The input is the only copy of what could not be carried over
+        if (attrs_lost)
+            zxc_log("Warning: %s: could not copy the mode and times of %s%s\n", resolved_out_path,
+                    resolved_in_path, remove_input ? "; input kept" : "");
+        else if (remove_input)
             unlink(resolved_in_path);
     } else {
         if (mode == MODE_INTEGRITY) {
@@ -1500,7 +1602,7 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
             }
         } else {
             zxc_log("Error: %s: %s\n", in_path ? in_path : "<stdin>", zxc_error_name((int)bytes));
-            if (created_out_file) unlink(resolved_out_path);
+            if (created_out_file && !out_special) unlink(resolved_out_path);
         }
         overall_ret = 1;
     }
@@ -1554,6 +1656,7 @@ int main(int argc, char** argv) {
 
     static const struct option long_options[] = {{"train", no_argument, 0, OPT_TRAIN_DICT},
                                                  {"progress", required_argument, 0, OPT_PROGRESS},
+                                                 {"no-preserve", no_argument, 0, OPT_NO_PRESERVE},
                                                  {"output", required_argument, 0, 'o'},
                                                  {"dict", required_argument, 0, 'D'},
                                                  {"compress", no_argument, 0, 'z'},
@@ -1685,6 +1788,9 @@ int main(int argc, char** argv) {
                 break;
             case OPT_TRAIN_DICT:
                 mode = MODE_TRAIN_DICT;
+                break;
+            case OPT_NO_PRESERVE:
+                g_preserve = 0;
                 break;
             case OPT_PROGRESS:
                 if (optarg != NULL && strcmp(optarg, "auto") == 0)
@@ -1975,18 +2081,13 @@ int main(int argc, char** argv) {
             }
         }
 
-        FILE* out;
-#ifdef _WIN32
-        out = fopen(final_path, "wb");
-#else
-        {
-            const int fd = open(final_path, O_CREAT | O_WRONLY | O_TRUNC,
-                                S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-            out = (fd != -1) ? fdopen(fd, "wb") : NULL;
-        }
-#endif
+        int special;  // device or FIFO: never unlinked
+        FILE* const out = zxc_create_output(final_path, force, 0, &special);
         if (!out) {
-            fprintf(stderr, "Error: cannot create '%s': %s\n", final_path, strerror(errno));
+            if (errno == EEXIST && !force)
+                fprintf(stderr, "Output exists. Use -f to overwrite '%s'.\n", final_path);
+            else
+                fprintf(stderr, "Error: cannot create '%s': %s\n", final_path, strerror(errno));
             free(zxd);
             free(dict);
             return 1;
@@ -1996,7 +2097,7 @@ int main(int argc, char** argv) {
         free(zxd);
         if (nwritten != (size_t)zxd_sz || close_rc != 0) {
             fprintf(stderr, "Error: failed to write '%s': %s\n", final_path, strerror(errno));
-            unlink(final_path);
+            if (!special) unlink(final_path);
             free(dict);
             return 1;
         }
