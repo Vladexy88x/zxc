@@ -1224,6 +1224,34 @@ static FILE* zxc_create_output(const char* path, int force, int owner_only, int*
 #endif
 }
 
+/**
+ * @brief Whether @p path already names the file open as @p in, whatever its
+ *        spelling (letter case, 8.3 short name, a link on Windows).
+ *
+ * On Windows opening the output truncates whatever it resolves to, so any
+ * identity counts. On POSIX the output's name is unlinked first, which only
+ * loses the input when that name is its sole one: a hard link or a symlink
+ * to the input is safely replaced.
+ */
+static int zxc_is_input_file(FILE* in, const char* path) {
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION a, b;
+    const HANDLE hin = (HANDLE)_get_osfhandle(_fileno(in));
+    if (hin == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(hin, &a)) return 0;
+    const HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;  // no output yet
+    const int ok = GetFileInformationByHandle(h, &b);
+    CloseHandle(h);
+    return ok && a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
+           a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+#else
+    struct stat a, b;
+    return fstat(fileno(in), &a) == 0 && lstat(path, &b) == 0 && a.st_dev == b.st_dev &&
+           a.st_ino == b.st_ino && b.st_nlink == 1;
+#endif
+}
+
 /** @brief Input attributes copied to the output, as gzip and zstd do. */
 typedef struct {
     int valid;  // 0: input is not a regular file
@@ -1364,7 +1392,8 @@ static int process_single_file(const char* in_path, const char* out_path_overrid
 
         // Safety check on resolved paths: opening the output with O_TRUNC would
         // destroy the input if both names refer to the same file
-        if (!use_stdin && strcmp(resolved_in_path, resolved_out_path) == 0) {
+        if (!use_stdin && (strcmp(resolved_in_path, resolved_out_path) == 0 ||
+                           zxc_is_input_file(f_in, resolved_out_path))) {
             zxc_log("Error: Input and output files are identical for '%s'.\n", in_path);
             fclose(f_in);
             return 1;

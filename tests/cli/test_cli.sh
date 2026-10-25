@@ -2137,5 +2137,24 @@ else
     fi
 fi
 
+# 41. An output naming the input in another letter case, on a case-insensitive
+#     filesystem (Windows, default macOS), is the input: refused, input intact
+echo "Testing -f -o onto the input spelled in another case..."
+CASE_IN="$TEST_DIR/case_in.txt"
+CASE_OUT="$TEST_DIR/CASE_IN.TXT"
+cp "${TEST_FILE}.orig" "$CASE_IN"
+if [[ ! -e "$CASE_OUT" ]]; then
+    echo "  [SKIP] case-sensitive filesystem"
+else
+    if "$ZXC_BIN" -q -k -f -o "$CASE_OUT" "$CASE_IN" 2>/dev/null; then
+        log_fail "-f -o onto the input in another case was not refused"
+    elif cmp -s "$CASE_IN" "${TEST_FILE}.orig"; then
+        log_pass "-f -o onto the input in another case is refused, input kept"
+    else
+        log_fail "-f -o onto the input in another case destroyed it ($(wc -c < "$CASE_IN" | tr -d ' ') of $FILE_SIZE bytes left)"
+    fi
+fi
+rm -f "$CASE_IN"
+
 echo "All tests passed!"
 exit 0
