@@ -75,7 +75,7 @@ callback. It is opt-in only because most consumers do not need
 random-access decompression; it does not pull `<stdio.h>`. Kernel /
 embedded consumers can include it directly.
 
-Porting to a libc-less target: [contrib/linux-kernel](../contrib/linux-kernel/README.md).
+Porting to a libc-less target: [contrib/linux-kernel](../contrib/linux-kernel/README.md); Windows drivers: [contrib/windows-kernel](../contrib/windows-kernel/README.md).
 
 `zxc_stream.h` is the only header that requires `<stdio.h>`. It groups
 every `FILE*`-flavored entry point: the multi-threaded streaming driver
@@ -212,7 +212,7 @@ Levels 1..5 produce data decompressible at essentially the **same speed**;
 levels 6 and 7 add a per-block Huffman decode step — literals at level 6,
 literals *and* sequence tokens at level 7 — trading some decode throughput for
 denser output (level 7 is the densest and carries the largest decode cost).
-Pass `0` for level to use `ZXC_LEVEL_DEFAULT`.
+Pass `0` for level to use `ZXC_LEVEL_DEFAULT`. Other levels are clamped to 1–7.
 
 ### 5.4 Error Codes
 
@@ -450,6 +450,21 @@ anchor per 64 blocks plus a `u32` per block, about 4.1 bytes per block) counts
 only when the header's `HAS_SEEK_TABLE` announces it. Always
 size the buffer with this function rather than re-deriving the formula.
 
+In practice the margin is one block, plus 8–12 bytes per block of framing, plus
+~2 KB of tail; a static context (`zxc_decompress_inplace_dctx`) is three to four
+blocks. The block size (`-B`) decides both (archives without a seek table):
+
+| Block size (`-B`) | Margin, 8 MB payload | Static context |
+| ---: | ---: | ---: |
+| 4 KB | 22–30 KB (0.3–0.4 %) | 16 KB |
+| 64 KB | 67–68 KB (0.8 %) | 208 KB |
+| 512 KB (default) | 514 KB (6.3 %) | 1.6 MB |
+
+The higher margin is with block checksums, which the CLI writes by default. A
+seek table (`-S`) adds its ~4.1 bytes per block: +8 KB at 4 KB blocks, under
+1 KB above. Smaller blocks cost some ratio and decode speed; measure on your
+data.
+
 **Returns**: required buffer size, or `0` if `src` is not a valid archive.
 
 ### `zxc_decompress_inplace`
@@ -653,7 +668,7 @@ ZXC_EXPORT int64_t zxc_compress_block(
     size_t                     src_size,
     void*                      dst,
     size_t                     dst_capacity,
-    const zxc_compress_opts_t* opts       // NULL = defaults
+    const zxc_compress_opts_t* opts       // NULL = sticky settings
 );
 ```
 
@@ -669,7 +684,8 @@ use the frame API (`zxc_compress`) or streaming API (`zxc_cstream_*`), which
 chunk transparently into format-conformant blocks.
 
 **Returns**: compressed block size (> 0) on success, or negative `zxc_error_t`.
-Returns `ZXC_ERROR_BAD_BLOCK_SIZE` if `src_size > ZXC_BLOCK_SIZE_MAX`.
+Returns `ZXC_ERROR_BAD_BLOCK_SIZE` if `src_size > ZXC_BLOCK_SIZE_MAX`, or if
+`block_size` is not a power of two in range.
 
 ### `zxc_decompress_block`
 
@@ -726,7 +742,7 @@ for integrations whose output buffer cannot be oversized (page-aligned
 decoding into mapped pages, fixed-size slots in a columnar layout, etc.).
 
 Output is **bit-identical** to `zxc_decompress_block()`. RAW blocks
-transparently forward to the fast path; only GLO/GHI blocks use the
+transparently forward to the fast path; only SPL/PAK blocks use the
 strict-tail decoder, which is slightly slower than the wild-copy fast path
 (see the performance table in `EXAMPLES.md`).
 
@@ -776,7 +792,9 @@ ZXC_EXPORT zxc_cctx* zxc_create_cctx(const zxc_compress_opts_t* opts);
 
 Creates a heap-allocated compression context.  
 When `opts` is non-NULL, internal buffers are pre-allocated (eager init).  
-When `opts` is NULL, allocation is deferred to first use (lazy init).
+When `opts` is NULL, allocation is deferred to first use (lazy init).  
+The creation options are also what a zero `level` or `block_size` in a later
+call falls back to (the library defaults for NULL).
 
 **Returns**: context pointer, or `NULL` on allocation failure.
 
@@ -802,7 +820,8 @@ ZXC_EXPORT int64_t zxc_compress_cctx(
 ```
 
 Same as `zxc_compress()` but reuses internal buffers from `cctx`.
-Automatically re-initializes when `block_size` or `level` changes. A zero
+The workspace is re-carved when the block size changes, or when a level raise
+into `ZXC_LEVEL_DENSITY` needs the optimal-parser scratch. A zero
 `src_size` writes the empty archive, as `zxc_compress()` does, without carving
 the workspace. Dictionary options are honoured as in `zxc_compress()` but are
 not sticky; the shared literal table is rebuilt only when it changes. A static
@@ -810,9 +829,11 @@ context returns `ZXC_ERROR_DICT_UNSUPPORTED` for any dictionary. `seekable`
 appends the seek table as `zxc_compress()` does, without allocating, static
 contexts included.
 
-Each entry point remembers the options it uses: `level`, `block_size`,
-`checksum_enabled` and `seekable` here, the first three for
-`zxc_compress_block()`.
+Options are **sticky**: `NULL` reuses the last successful call's `level`,
+`block_size`, `checksum_enabled` and `seekable` (the first three for
+`zxc_compress_block()`), starting from the creation options. A zero `level` or
+`block_size` in a non-NULL `opts` means the value the context was created
+with, never an earlier call's. A failed call leaves them untouched.
 
 ### `zxc_create_dctx`
 
@@ -1014,12 +1035,16 @@ free(dws);
 
 ### Sizing notes
 
+Values returned by `zxc_static_cctx_workspace_size` /
+`zxc_static_dctx_workspace_size` (arm64; the dctx column is the whole static
+workspace, work, literal, token and PivCo buffers included):
+
 | `block_size` | level 1-5 cctx | level 6-7 cctx | dctx |
 |---|---|---|---|
-| 4 KB        | ~280 KB         | ~320 KB       | ~9 KB  |
-| 64 KB       | ~410 KB         | ~930 KB       | ~129 KB |
-| 512 KB      | ~1.5 MB         | ~5.7 MB       | ~1 MB  |
-| 2 MB        | ~5.0 MB         | ~21 MB        | ~4 MB  |
+| 4 KB        | ~307 KB         | ~519 KB       | ~16 KB  |
+| 64 KB       | ~489 KB         | ~1.0 MB       | ~208 KB |
+| 512 KB      | ~1.8 MB         | ~5.9 MB       | ~1.6 MB |
+| 2 MB        | ~6.3 MB         | ~22.5 MB      | ~6.4 MB |
 
 (Exact figures depend on architecture and alignment padding; always query
 `zxc_static_*_workspace_size` rather than hard-coding.)

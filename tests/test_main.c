@@ -17,8 +17,8 @@ typedef struct {
 static const test_entry_t g_tests[] = {
     /* --- Streaming round-trip coverage (patterns x sizes x levels x checksum) --- */
     TEST_CASE(test_roundtrip_raw_random),
-    TEST_CASE(test_roundtrip_ghi_text),
-    TEST_CASE(test_roundtrip_glo_text),
+    TEST_CASE(test_roundtrip_pak_text),
+    TEST_CASE(test_roundtrip_spl_text),
     TEST_CASE(test_roundtrip_num_seq),
     TEST_CASE(test_roundtrip_num_zero),
     TEST_CASE(test_roundtrip_num_small),
@@ -50,7 +50,7 @@ static const test_entry_t g_tests[] = {
     TEST_CASE(test_buffer_api),
     TEST_CASE(test_buffer_api_scratch_buf),
     TEST_CASE(test_min_dist_policy),
-    TEST_CASE(test_glo_match_split),
+    TEST_CASE(test_spl_match_split),
     TEST_CASE(test_buffer_error_codes),
     TEST_CASE(test_decompress_inplace),
     TEST_CASE(test_get_decompressed_size),
@@ -75,6 +75,8 @@ static const test_entry_t g_tests[] = {
     TEST_CASE(test_context_api_seekable_frame),
     TEST_CASE(test_context_api_seekable_compress),
     TEST_CASE(test_cctx_level_raise_reinit),
+    TEST_CASE(test_cctx_zero_opts_defaults),
+    TEST_CASE(test_cctx_zero_opts_creation_values),
     TEST_CASE(test_estimate_cctx_size),
 
     /* --- Static Context API --- */
@@ -151,6 +153,7 @@ static const test_entry_t g_tests[] = {
     TEST_CASE(test_footer_digest),
     TEST_CASE(test_seek_tail_rule),
     TEST_CASE(test_chunk_size_code),
+    TEST_CASE(test_file_header_reserved),
     TEST_CASE(test_header_checksum_single_bit),
 
     /* --- Encoder output --- */

@@ -92,10 +92,11 @@ Offset  Size  Field
   - Bit 5 (`0x20`): `HAS_SEEK_TABLE` — a SEK block (§5.5) sits between the EOF block and the
     footer. Clear, the footer follows the EOF block directly.
   - Bits 0..3: checksum algorithm id (`0` = RapidHash-based folding).
-  - Bit 4: reserved.
+  - Bit 4: reserved, must be 0. A decoder **MUST** reject the header when it is set.
 - **Reserved / Dictionary ID**: 7 bytes.
   - When `HAS_DICTIONARY` is set: bytes `0x07..0x0A` contain a `dict_id` (`u32` LE), a 32-bit hash of the dictionary content. Bytes `0x0B..0x0D` remain zero.
   - When `HAS_DICTIONARY` is clear: all 7 bytes are zero.
+  - A decoder **MUST** reject the header when a byte required to be zero is not.
 - **Header Checksum** (`u16`): the 16-bit header checksum of [7.1](#71-header-checksums), computed over the 16-byte header with bytes `0x0E..0x0F` zeroed.
 
 ---
@@ -117,15 +118,15 @@ Offset  Size  Field
 
 - **Block Type**:
   - `0` = RAW
-  - `1` = GLO
-  - `2` = GHI
+  - `1` = SPL
+  - `2` = PAK
   - `254` = SEK
   - `255` = EOF
-- **Block Flags**: no flag is defined; must be 0.
-- **Reserved**: must be 0. In the EOF and SEK headers, this byte and Block Flags are checked
-  (§5.4, §5.5).
+- **Block Flags**: no flag is defined; must be 0. A decoder **MUST** reject a non-zero value.
+- **Reserved**: must be 0. A decoder **MUST** reject a non-zero value, in every block type
+  (§10.3).
 - **Compressed Payload Size** (`comp_size`): payload size in bytes (does **not** include the optional trailing 4-byte block
-  checksum). For a data block (RAW, GLO, GHI) it never exceeds the `block_size` declared in the
+  checksum). For a data block (RAW, SPL, PAK) it never exceeds the `block_size` declared in the
   file header: a block that would grow falls back to RAW, whose payload equals its content, so
   `block_size` is reached exactly and never passed. A decoder **MUST** reject a larger value.
   This does not apply to SEK, which is not a data block: its payload is a table of block
@@ -156,22 +157,22 @@ Payload is uncompressed data.
 +-------------------------------+
 ```
 
-No internal sub-header: unlike GLO and GHI, the payload starts at the first
+No internal sub-header: unlike SPL and PAK, the payload starts at the first
 byte. The decoded size is therefore the Compressed Payload Size, and a RAW
 block is the only one whose payload reaches that bound exactly.
 
 ---
 
-## 5.2 GLO block (`type=1`)
+## 5.2 SPL block (`type=1`)
 
-"General LZ, LOw throughput": LZ-style format with separated streams, trading
-decode throughput for ratio.
+"SPLit streams": LZ format whose tokens, literals, offsets and extras live in
+separate sections, trading decode throughput for ratio.
 
-### GLO payload layout
+### SPL payload layout
 
 ```text
 +-------------------------------+
-| GLO Header (12 bytes)         |
+| SPL Header (12 bytes)         |
 +-------------------------------+
 | Section descriptors (0/4/8B)  |
 +-------------------------------+
@@ -185,7 +186,7 @@ decode throughput for ratio.
 +-------------------------------+
 ```
 
-### GLO Header (12 bytes)
+### SPL Header (12 bytes)
 
 ```text
 Offset  Size  Field
@@ -197,7 +198,7 @@ Offset  Size  Field
 0x0B    1     Offset Encoding (enc_off)
 ```
 
-#### GLO header semantics
+#### SPL header semantics
 
 - **Sequence Count** (`u32`): number of sequences in the block. It sizes the
   token and offset sections, so it cannot be forged against them.
@@ -211,13 +212,13 @@ Offset  Size  Field
 - **Offset Encoding** (`u8`): `0` = 16-bit offsets, `1` = 8-bit offsets.
 
 **Literal Encoding**, **Token Encoding** and **Offset Encoding** are closed value
-sets: a GLO decoder **MUST** reject any value outside the ones listed above
+sets: a SPL decoder **MUST** reject any value outside the ones listed above
 rather than fall back to a default. This is not a memory-safety requirement — a
-GLO block sizes its offset section and reads it from the same width, so the two
+SPL block sizes its offset section and reads it from the same width, so the two
 cannot disagree — but it keeps the undefined byte values genuinely free for a
 later format version instead of aliasing them onto an existing meaning.
 
-### GLO section descriptors (0, 4 or 8 bytes)
+### SPL section descriptors (0, 4 or 8 bytes)
 
 Only the two sizes the header cannot imply are stored, each a `u32` and only
 when present, in this order:
@@ -236,7 +237,7 @@ Everything else is derived, so it cannot be forged inconsistently:
 - **extras size = whatever payload remains** after the three sections above.
 
 RAW literals and RAW tokens carry **no descriptor at all**. RLE or Huffman
-literals add 4 bytes (RLE at any GLO level, Huffman from level 6) and Huffman
+literals add 4 bytes (RLE at any SPL level, Huffman from level 6) and Huffman
 tokens (level 7) 4 more: 0 or 4 bytes at levels 3 to 6, up to 8 at level 7.
 
 Because the extras section is sized as the residue and its values are read on
@@ -263,10 +264,10 @@ padding until they do. The padding falls inside the extras residue, so it needs
 no field of its own; its contents are unconstrained and **MUST NOT** be
 validated.
 
-The same rule and the same reasoning apply to GHI (§ 5.3), where the sequences
+The same rule and the same reasoning apply to PAK (§ 5.3), where the sequences
 and extras sections play the role of tokens/offsets/extras.
 
-### GLO stream content
+### SPL stream content
 
 - **Literals section**:
   - raw literal bytes when Literal Encoding is `0`, or
@@ -377,9 +378,9 @@ data built on short repeats — periodic runs, tightly structured records —
 keeps them, because banning them there costs size *and* decode time. Levels 6
 and 7 keep every distance. Like the nudge, this changes which sequences an
 encoder emits, never how they are encoded, so the archive stays an ordinary
-GLO/GHI block and any conforming decoder reads it.
+SPL/PAK block and any conforming decoder reads it.
 
-A third encoder-side policy re-emits long matches inline. A GLO token holds
+A third encoder-side policy re-emits long matches inline. A SPL token holds
 the match length in its 4-bit ML field and escapes any match longer than 19
 bytes (`ML == 15`) to a varint. At levels 3 to 5 the reference encoder instead
 re-emits such a match, up to a per-level cap, as a chain of inline matches of
@@ -387,9 +388,9 @@ at most 19 bytes at the same offset (a 24-byte match as 19 + 5, a 38-byte match
 as 19 + 19), so the decoder never takes its ML escape. It does this per
 block and only when that escape looks poorly predicted: on regular data the
 branch is already predictable and splitting would only add sequences for no
-decode gain. Levels 1 and 2 (GHI) and levels 6 and 7 keep every escape. Like
+decode gain. Levels 1 and 2 (PAK) and levels 6 and 7 keep every escape. Like
 the distance floor, this changes which sequences an encoder emits, never how
-they are encoded, so the archive stays an ordinary GLO block and any
+they are encoded, so the archive stays an ordinary SPL block and any
 conforming decoder reads it.
 
 Decoder validation requirements:
@@ -435,16 +436,16 @@ run that overshoots `n_literals`, a section that ends before reaching it, or
 bytes left over once it is reached are corrupt data. An RLE section for
 `n_literals = 0` is empty.
 
-## 5.3 GHI block (`type=2`)
+## 5.3 PAK block (`type=2`)
 
-"General LZ, HIgh throughput": LZ format with packed 32-bit sequences, trading
-ratio for decode throughput.
+"PAcKed sequences": LZ format with each sequence packed into one 32-bit word,
+trading ratio for decode throughput.
 
-### GHI payload layout
+### PAK payload layout
 
 ```text
 +-------------------------------+
-| GHI Header (12 bytes)         |
+| PAK Header (12 bytes)         |
 +-------------------------------+
 | Literals section              |
 +-------------------------------+
@@ -454,22 +455,22 @@ ratio for decode throughput.
 +-------------------------------+
 ```
 
-### GHI Header (12 bytes)
+### PAK Header (12 bytes)
 
-Same binary layout as the GLO header: Sequence Count, Literal Count, Literal
+Same binary layout as the SPL header: Sequence Count, Literal Count, Literal
 Encoding, Token Encoding, Match Length Encoding, Offset Encoding.
 
-In practice for GHI:
+In practice for PAK:
 - **Literal Encoding** and **Token Encoding** MUST be `0` (raw literals, so the
   literal section size is `n_literals`); a decoder rejects any other value.
 - **Match Length Encoding** is written as `0` and ignored.
-- **Offset Encoding** is written as `0` and **must be ignored on decode**: GHI has
+- **Offset Encoding** is written as `0` and **must be ignored on decode**: PAK has
   no offset section, sequence words always store 16-bit offsets, so the field
   bounds nothing.
 
-### GHI section descriptors: none
+### PAK section descriptors: none
 
-Every size follows from the header, so GHI writes no descriptor at all:
+Every size follows from the header, so PAK writes no descriptor at all:
 
 - literals = `n_literals` (always RAW)
 - sequences = `n_sequences × 4`
@@ -477,7 +478,7 @@ Every size follows from the header, so GHI writes no descriptor at all:
 
 The § 5.2 literal-section slack rule applies here too.
 
-### GHI sequence word format (32 bits)
+### PAK sequence word format (32 bits)
 
 ```text
 Bits 31..24 : LL (literal length, 8 bits)
@@ -630,7 +631,7 @@ For example, the two bytes `AC 04` decode as the 2-byte form:
 `(0xC3 AND 0x1F) OR (0x35 << 5) OR (0x0C << 13)` = 3 + 1696 + 98304 =
 **100003**.
 
-Used by GLO/GHI to carry LL/ML overflows beyond token/sequence inline
+Used by SPL/PAK to carry LL/ML overflows beyond token/sequence inline
 limits.
 
 **Value bound**: a varint encodes `(LL - MASK)` or `(ML - MASK)`.
@@ -804,9 +805,9 @@ Example: 10 000 000 source bytes compressed to a 3 000 000-byte prefix, no check
 2. Parse blocks sequentially:
    - validate block header checksum,
    - check block bounds using the Compressed Payload Size.
-3. Decode payload according to block type. For GLO/GHI:
-   - reject Literal Encoding, Token Encoding and (GLO) Offset Encoding values
-     outside § 5.2 (GHI: Literal or Token Encoding other than 0, § 5.3),
+3. Decode payload according to block type. For SPL/PAK:
+   - reject Literal Encoding, Token Encoding and (SPL) Offset Encoding values
+     outside § 5.2 (PAK: Literal or Token Encoding other than 0, § 5.3),
    - reject a block leaving fewer than 32 bytes behind its literal section,
    - check the derived section sizes still fit the payload.
 4. If enabled, verify the trailing block checksum over the decoded bytes,
@@ -841,7 +842,7 @@ encoding, layout, or the checksum algorithm — requires a **version bump**.
 |---|---|---|
 | New block type added | **Version bump** (decoders reject unknown types) | Adding a hypothetical `GLR` block type |
 | Reserved field/flag bit assigned meaning | **Version bump** | Defining a reserved flag bit |
-| Existing block encoding changed | **Version bump** | Changing GLO token layout |
+| Existing block encoding changed | **Version bump** | Changing SPL token layout |
 | Header/footer layout changed | **Version bump** | Resizing the file header |
 | Checksum algorithm changed | **Version bump** | Replacing RapidHash with Komihash |
 
@@ -849,7 +850,7 @@ encoding, layout, or the checksum algorithm — requires a **version bump**.
 
 - **Version compatibility**: a decoder accepts **only** the format version it implements and **MUST** reject any other version. Because block-type numbering and payload formats may change between versions, a decoder **MUST NOT** attempt to interpret an archive whose version byte it does not recognise.
 - **Unknown block types**: a decoder **MUST reject** any block whose type is not defined for its format version. The block-type set is fixed per version; introducing a new type is a version bump (decoders do **not** skip unknown blocks — silently advancing past untrusted, unrecognised data is unsafe).
-- **Reserved fields**: all reserved bytes and flag bits **MUST** be written as zero by encoders. The current decoder tolerates (ignores) non-zero reserved values — they are covered by the header checksum, so accidental corruption is still caught — but assigning a reserved field any meaning is a **version bump**, never a same-version extension. Exception: a decoder rejects an EOF or SEK header whose Block Flags or Reserved byte is non-zero (§5.4, §5.5), and a footer whose `L` byte sets bit 3 or 7 (§8).
+- **Reserved fields**: all reserved bytes and flag bits **MUST** be written as zero by encoders. Assigning a reserved field any meaning is a **version bump**, never a same-version extension. A decoder rejects a file header that sets flag bit 4 or a reserved byte (§3), a block header whose Block Flags or Reserved byte is non-zero, whatever the block type (§4.1), and a footer whose `L` byte sets bit 3 or 7 (§8); a dictionary loader rejects a `.zxd` header with non-zero Flags or Reserved bytes (§12.4). The SPL/PAK sub-header fields written as 0 and ignored on decode (Match Length Encoding, PAK Offset Encoding, §5.2, §5.3) are the exception.
 - **Defined-but-bounded fields**: where only specific values are defined (e.g. the checksum-algorithm id, currently `0` = RapidHash only), the decoder **rejects** out-of-range values as a corrupt header.
 
 ### 10.4 Minimum conforming decoder
@@ -857,9 +858,9 @@ encoding, layout, or the checksum algorithm — requires a **version bump**.
 A minimal conforming decoder for version 9 **MUST** support:
 - File header parsing and checksum validation
 - **RAW** blocks (type 0) - passthrough copy.
-- **GLO** blocks (type 1) - full LZ decode with extras varint, including Huffman
+- **SPL** blocks (type 1) - full LZ decode with extras varint, including Huffman
   entropy sections (§5.2.1, PivCo layout) with code lengths up to 11 bits.
-- **GHI** blocks (type 2) - full LZ decode with extras varint.
+- **PAK** blocks (type 2) - full LZ decode with extras varint.
 - **EOF** block (type 255) - stream termination.
 - **SEK** block (type 254) - header check and table skip when `HAS_SEEK_TABLE=1` (§5.5).
 - File footer validation (§8: both sizes, minimal lengths, `L` byte).
@@ -884,8 +885,10 @@ The recommended behavior for each class is specified below.
 | **Bad magic** | File header, offset 0x00 | Reject immediately. Not a ZXC file. |
 | **Unsupported version** | File header, offset 0x04 | Reject immediately. Version not supported. |
 | **File header checksum mismatch** | File header, offset 0x0E | Reject. Header is corrupt or truncated. |
+| **File header reserved bit or byte set** | File header, offsets 0x06-0x0D | Reject. Flag bit 4, or a byte of `0x07..0x0D` outside the `dict_id` (§3). |
 | **Invalid chunk size code** | File header, offset 0x05 | Reject. Code outside the valid range `[12..21]`. |
 | **Block header checksum mismatch** | Block header, offset 0x07 | Reject block. Stream is corrupt. |
+| **Block Flags or Reserved non-zero** | Block header, offsets 0x01-0x02 | Reject. No flag is defined and the reserved byte has no meaning in this version (§4.1, §10.3). |
 | **Unknown block type** | Block header, offset 0x00 | Reject. The block-type set is fixed per format version (see §10.3); a decoder must not skip past unrecognised data. |
 | **Block payload truncated** | While reading the Compressed Payload Size bytes | Reject. Unexpected end of stream. |
 | **Block checksum mismatch** | Trailing 4-byte checksum, after decoding the block | Reject block. The decoded bytes are wrong: corrupt payload, wrong dictionary, or a block out of place. |
@@ -980,7 +983,7 @@ Offset  Size  Field
 0x06    2     Content size (u16 LE, max 65535)
 0x08    4     dict_id (u32 LE, binds content AND shared table, see below)
 0x0C    2     Reserved (0)
-0x0E    2     Header Checksum (see 7.1, computed with 0x0C-0x0F zeroed)
+0x0E    2     Header Checksum (see 7.1, computed with 0x0E-0x0F zeroed)
 0x10    N     Dictionary content (raw bytes)
 0x10+N  128   Shared literal Huffman table (256 × 4-bit packed code lengths,
               same layout as the § 5.2.1 code-length header; always present)
@@ -991,14 +994,15 @@ Offset  Size  Field
   an unsupported dictionary version. Version 1 shipped with format v8: its header
   was signed with the pre-v9 checksum, not the one § 7.1 now specifies, so it is
   rejected on the version byte before the checksum is ever compared.
-- **Flags**: bits `0..3` carry the checksum algorithm id (`0` = RapidHash-based folding), matching the ZXC file header flags; bits `4..7` are reserved (must be 0).
+- **Flags**: bits `0..3` carry the checksum algorithm id (`0` = RapidHash-based folding), matching the ZXC file header flags; bits `4..7` are reserved (must be 0). A loader **MUST** reject any other id or a reserved bit set.
+- **Reserved** (`0x0C..0x0D`): must be 0; a loader **MUST** reject a non-zero value.
 - **Shared literal Huffman table**: code lengths for the Literal Encoding `3` literal
   sections (§ 5.2.2), trained on the corpus' post-LZ literal distribution.
 - **dict_id**: `fold32(rapidhash(table_128_bytes, seed = fold32(rapidhash(content))))`
   (see [12.3](#123-file-header-encoding)) — binds the exact (content, table)
   pair. Must match the `dict_id` stored in any ZXC file header that references
   this dictionary.
-- **Header Checksum**: the 16-bit header checksum of [7.1](#71-header-checksums), computed over the 16-byte header with bytes `0x0C..0x0F` zeroed.
+- **Header Checksum**: the 16-bit header checksum of [7.1](#71-header-checksums), computed over the 16-byte header with bytes `0x0E..0x0F` zeroed.
 - **Content**: raw bytes that prefill the LZ77 window. Not compressed.
 
 ### 12.5 Dictionary training
@@ -1035,11 +1039,11 @@ as follows:
 - File header: **16** bytes
 - Block header: **8** bytes
 - Block checksum (optional): **4** bytes
-- GLO header: **12** bytes
-- GHI header: **12** bytes
+- SPL header: **12** bytes
+- PAK header: **12** bytes
 - Section descriptor: **4** bytes (`u32`, written only when needed)
-- GLO descriptors total: **0**, **4** or **8** bytes (+4 for RLE/Huffman literals, +4 for Huffman tokens)
-- GHI descriptors total: **0** bytes
+- SPL descriptors total: **0**, **4** or **8** bytes (+4 for RLE/Huffman literals, +4 for Huffman tokens)
+- PAK descriptors total: **0** bytes
 - Minimum slack behind the literal section: **32** bytes
 - File footer: **3** to **17** bytes (**+8** with a digest)
 - Dictionary file header (`.zxd`): **16** bytes
@@ -1270,7 +1274,7 @@ C7 D1 B0 9C | 02 | 00 | 05 00 | 34 07 FC 0C | 00 00 | C6 51
 - `05 00` -> content size (LE) = `5` bytes.
 - `34 07 FC 0C` -> `dict_id` (LE) = `0x0CFC0734`. Binds the **(content, table)** pair (see §12.4) and must match the `dict_id` stored in the file header of any `.zxc` archive compressed with this dictionary.
 - `00 00` -> reserved.
-- `C6 51` -> header checksum (LE) = `0x51C6`, computed over the 16-byte header with bytes `0x0C..0x0F` zeroed (same method as the ZXC file header — the checksum is the last 2 bytes of the header).
+- `C6 51` -> header checksum (LE) = `0x51C6`, computed over the 16-byte header with bytes `0x0E..0x0F` zeroed (same method as the ZXC file header — the checksum is the last 2 bytes of the header).
 
 #### B) Dictionary Content (offset `0x10`, 5 bytes)
 

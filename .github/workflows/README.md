@@ -12,7 +12,17 @@ Builds and tests ZXC across multiple platforms (Linux x86_64/ARM64, macOS ARM64,
 ### multiarch.yml - Multi-Architecture Build
 **Triggers:** Push to main, pull requests, manual dispatch
 
-Comprehensive build matrix testing across multiple architectures including 32-bit and 64-bit variants for Linux (x64, x86, ARM64, ARM) and Windows (x64, x86). Validates compilation compatibility across different platforms.
+Builds and tests ZXC across CPU architectures, Debian's included (GNU/Hurd aside: an OS, not a CPU), in three tiers:
+- **Tier 1** (native runners, every supported image): Ubuntu 22.04/24.04/26.04 (x86_64, i386, arm64), Windows Server 2022/2025 (x86_64, i386), Windows 11 (arm64), macOS 15/26 (x86_64, arm64) and macOS 27 (arm64, preview image).
+- **Tier 2** (Debian release architectures, cross-compiled in `debian:trixie`, tested under QEMU): armhf (with LTO), ppc64le, s390x, riscv64, loong64; plus x86_64 under Intel SDE, one job per SIMD dispatch tier (SSE2, AVX2, AVX-512).
+- **Tier 3** (Debian ports and retired architectures, same setup): armv6, mipsel, powerpc, ppc64, sparc64, alpha, hppa, m68k, sh4.
+
+Tier 1 and Tier 2 are required checks on `main`; Tier 3 is not.
+
+### downstream.yml - Downstream Builds
+**Triggers:** Push to main, pull requests, manual dispatch
+
+Builds and tests ZXC as downstream distributions build it, each in its own environment (libc, OS, compiler, packaging flags): Alpine (musl, x86_64 and arm64), Arch Linux and AlmaLinux 9 (RHEL 9) built with their distro packaging flags, Amazon Linux 2023 (arm64), and FreeBSD 14 and 15 in a VM. Warnings are errors at compile and at LTO link time.
 
 ### multicomp.yml - Compiler Compatibility
 **Triggers:** Push to main, pull requests, manual dispatch
@@ -32,7 +42,7 @@ Runs performance benchmarks using LZbench on Ubuntu and macOS. Integrates ZXC in
 Builds the project with coverage instrumentation (`-DZXC_ENABLE_COVERAGE=ON`), runs unit and CLI tests, and generates a coverage report using `lcov`. The report is then uploaded to Codecov for analysis.
 
 ### fuzzing.yml - Fuzz Testing
-**Triggers:** Pull requests, scheduled (every 3 days), manual dispatch
+**Triggers:** Pull requests, manual dispatch
 
 Executes fuzz testing using ClusterFuzzLite with multiple sanitizers (address, undefined) on decompression and roundtrip fuzzers. Helps identify memory safety issues and edge cases.
 
@@ -67,10 +77,15 @@ contract broke.
 
 The field-level structural validation runs separately, as the `format_golden` and `conformance` ctests in `build.yml`.
 
-### kernel.yml - Kernel Module
+### kernel-linux.yml - Linux Kernel Module
 **Triggers:** Changes to `contrib/linux-kernel/`, `include/` or `src/lib/`; weekly; manual dispatch
 
-Builds [`contrib/linux-kernel`](../../contrib/linux-kernel/README.md) - the dependency header, the shims, the Kbuild and the self-test module - against the runner kernel's headers, under `-Werror`. The module's init round-trips a block and a frame at levels 3 and 7 and refuses to load on a mismatch. Off the PR path on purpose.
+Builds [`contrib/linux-kernel`](../../contrib/linux-kernel/README.md) - the dependency header, the shims, the Kbuild and the self-test module - against Linux 4.19 (the minimum) and the runner kernel's headers, on x86_64 and arm64, under `-Werror`. The module's init round-trips a block and a frame at levels 3 and 7 and refuses to load on a mismatch. Off the PR path on purpose.
+
+### kernel-windows.yml - Windows Kernel Library
+**Triggers:** Changes to `contrib/windows-kernel/`, `include/` or `src/lib/`; weekly; manual dispatch
+
+Builds [`contrib/windows-kernel`](../../contrib/windows-kernel/README.md) - the dependency header, the property sheets, the kernel-mode static library and the self-test driver that links it - for x64 and ARM64 at the Windows 10 2004 target, then asserts with `check-image.ps1` that the image imports `ntoskrnl.exe` only and is a Native image of the right machine and subsystem version. The runner image has Visual Studio 2026 with the WDK's Visual Studio extension but no kit, so the job installs the 28000 SDK and WDK, the kit line built for Visual Studio 2026, with Microsoft's installers first, each pinned to a versioned URL and checked against its SHA-256 and Authenticode signature. `check-image.ps1` also fails on any `ymm` or `zmm` register in the disassembly, so no AVX instruction reaches the image. Nothing is loaded; that is a manual step on a test-signed VM, as for the Linux module.
 
 ### scorecard.yml - OSSF Scorecard
 **Triggers:** Push to main, scheduled (weekly), manual dispatch

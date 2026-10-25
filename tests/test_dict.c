@@ -85,6 +85,26 @@ int test_dict_zxd_roundtrip(void) {
         return 0;
     }
 
+    /* Non-zero Flags or Reserved, checksum recomputed: refused. */
+    static const struct {
+        int at;
+        uint8_t v;
+    } odd[] = {{5, 0x01}, {5, 0x10}, {5, 0x80}, {12, 0x01}, {13, 0x01}};
+    for (size_t k = 0; k < sizeof(odd) / sizeof(odd[0]); k++) {
+        uint8_t* const bad = (uint8_t*)malloc((size_t)written);
+        memcpy(bad, zxd, (size_t)written);
+        bad[odd[k].at] = odd[k].v;
+        zxc_store_le16(bad + 14, 0);
+        zxc_store_le16(bad + 14, zxc_hash16(bad));
+        rc = zxc_dict_load(bad, (size_t)written, &loaded_content, &loaded_size, NULL, NULL);
+        free(bad);
+        if (rc != ZXC_ERROR_BAD_HEADER) {
+            printf("  [FAIL] byte 0x%02X = 0x%02X accepted (%d)\n", odd[k].at, odd[k].v, rc);
+            free(zxd);
+            return 0;
+        }
+    }
+
     free(zxd);
     printf("PASS\n\n");
     return 1;
@@ -639,7 +659,7 @@ int test_dict_large_dict_roundtrip(void) {
 }
 
 /*
- * Regression test for the GLO SAFE-loop dictionary back-reference path.
+ * Regression test for the SPL SAFE-loop dictionary back-reference path.
  *
  * The other dict roundtrip tests use gen_dict_friendly_data(), which scatters
  * dict-derived BYTES but never forms long matches, so the decoder never emits a
@@ -1970,7 +1990,7 @@ int test_dict_block_huf_roundtrip(void) {
                 break;
             }
             /* enc_lit sits at sub-header offset 8, right after the block header. */
-            const int table_used = comp[0] == ZXC_BLOCK_GLO && comp[ZXC_BLOCK_HEADER_SIZE + 8] == 3;
+            const int table_used = comp[0] == ZXC_BLOCK_SPL && comp[ZXC_BLOCK_HEADER_SIZE + 8] == 3;
             n_table += table_used;
             int64_t r = zxc_decompress_block(dctx, comp, (size_t)cs, out,
                                              BLK + ZXC_DECOMPRESS_TAIL_PAD, &d_tab);
@@ -2117,9 +2137,9 @@ int test_dict_id_collision_caught_by_checksum(void) {
     static uint8_t a[DSZ], b[DSZ], src[SRC], arc[SRC * 2], out[SRC * 2];
     for (int k = 0; k < 2; k++) {
         uint8_t* d = k ? b : a;
-        uint32_t s = (k ? 73013u : 58488u) * 2654435761u + 1u;
+        uint32_t s = (k ? 73013U : 58488U) * 2654435761U + 1U;
         for (int i = 0; i < DSZ; i++) {
-            s = s * 1103515245u + 12345u;
+            s = s * 1103515245U + 12345U;
             d[i] = (uint8_t)(s >> 16);
         }
     }
@@ -2177,9 +2197,9 @@ int test_dict_checksum_cross_paths(void) {
     printf("=== TEST: Dictionary - block checksums agree across paths ===\n");
     enum { DSZ = 2048, BS = 4096, N = 4 * BS };
     static uint8_t dict[DSZ], src[N], arc[2 * N], out[N];
-    uint32_t s = 0x1234567u;
+    uint32_t s = 0x1234567U;
     for (int i = 0; i < DSZ; i++) {
-        s = s * 1103515245u + 12345u;
+        s = s * 1103515245U + 12345U;
         dict[i] = (uint8_t)(s >> 16);
     }
     /* Built from slices of the dictionary, so the encoder emits matches into it. */

@@ -116,7 +116,7 @@ int test_round_trip(const char* test_name, const uint8_t* input, size_t size, in
 int test_buffer_api(void);
 int test_buffer_api_scratch_buf(void);
 int test_min_dist_policy(void);
-int test_glo_match_split(void);
+int test_spl_match_split(void);
 int test_buffer_error_codes(void);
 int test_get_decompressed_size(void);
 int test_frame_info(void);
@@ -141,6 +141,8 @@ int test_context_api_empty_input(void);
 int test_context_api_seekable_frame(void);
 int test_context_api_seekable_compress(void);
 int test_cctx_level_raise_reinit(void);
+int test_cctx_zero_opts_defaults(void);
+int test_cctx_zero_opts_creation_values(void);
 int test_estimate_cctx_size(void);
 
 /* Static Context API */
@@ -203,8 +205,8 @@ int test_pstream_dict_archive_rejected(void);
 
 /* Stream round-trip coverage (patterns x sizes x levels x checksum) */
 int test_roundtrip_raw_random(void);
-int test_roundtrip_ghi_text(void);
-int test_roundtrip_glo_text(void);
+int test_roundtrip_pak_text(void);
+int test_roundtrip_spl_text(void);
 int test_roundtrip_num_seq(void);
 int test_roundtrip_num_zero(void);
 int test_roundtrip_num_small(void);
@@ -285,6 +287,7 @@ int test_seek_flag_contract(void);
 int test_footer_digest(void);
 int test_seek_tail_rule(void);
 int test_chunk_size_code(void);
+int test_file_header_reserved(void);
 int test_header_checksum_single_bit(void);
 
 /* Encoder output */

@@ -1015,8 +1015,8 @@ int test_stream_engine_errors(void) {
 
 /* Encoder path coverage */
 RT_WRAPPER(test_roundtrip_raw_random, "RAW Block (Random Data)", gen_random_data, RT_BUF, 3, 0)
-RT_WRAPPER(test_roundtrip_ghi_text, "GHI Block (Text Pattern)", gen_lz_data, RT_BUF, 2, 0)
-RT_WRAPPER(test_roundtrip_glo_text, "GLO Block (Text Pattern)", gen_lz_data, RT_BUF, 4, 0)
+RT_WRAPPER(test_roundtrip_pak_text, "PAK Block (Text Pattern)", gen_lz_data, RT_BUF, 2, 0)
+RT_WRAPPER(test_roundtrip_spl_text, "SPL Block (Text Pattern)", gen_lz_data, RT_BUF, 4, 0)
 RT_WRAPPER(test_roundtrip_num_seq, "Numeric data (integer sequence)", gen_num_data, RT_BUF, 3, 0)
 RT_WRAPPER(test_roundtrip_num_zero, "Numeric data (zero deltas)", gen_num_data_zero, RT_BUF, 3, 0)
 RT_WRAPPER(test_roundtrip_num_small, "Numeric data (small deltas)", gen_num_data_small, RT_BUF, 3,
@@ -1075,32 +1075,29 @@ int test_roundtrip_offset_mixed(void) {
 }
 
 /**
- * @brief An out-of-range level on the streaming path behaves as the maximum one.
- *
- * Level 99 must produce byte-for-byte what ZXC_LEVEL_ULTRA produces.
+ * @brief On the streaming path, 99 must produce ULTRA's bytes and -5 FASTEST's.
  */
 int test_stream_level_clamp(void) {
-    printf("=== TEST: Stream - Out-of-range level clamps to ULTRA ===\n");
+    printf("=== TEST: Stream - Out-of-range level clamps to ULTRA / FASTEST ===\n");
 
     const size_t size = 96 * 1024;
     uint8_t* input = malloc(size);
     if (!input) return 0;
     gen_lz_data(input, size);
 
-    uint8_t* out[2] = {NULL, NULL};
-    long sz[2] = {0, 0};
-    const int levels[2] = {ZXC_LEVEL_ULTRA, 99};
+    uint8_t* out[4] = {NULL, NULL, NULL, NULL};
+    long sz[4] = {0, 0, 0, 0};
+    const int levels[4] = {ZXC_LEVEL_ULTRA, 99, ZXC_LEVEL_FASTEST, -5};
     int ok = 1;
 
-    for (int i = 0; i < 2 && ok; i++) {
+    for (int i = 0; i < 4 && ok; i++) {
         FILE* f_in = tmpfile();
         FILE* f_comp = tmpfile();
         if (!f_in || !f_comp) {
             printf("  [SKIP] tmpfile failed\n");
             if (f_in) fclose(f_in);
             if (f_comp) fclose(f_comp);
-            free(out[0]);
-            free(out[1]);
+            for (int j = 0; j < 4; j++) free(out[j]);
             free(input);
             return 1;
         }
@@ -1123,14 +1120,16 @@ int test_stream_level_clamp(void) {
         fclose(f_comp);
     }
 
-    if (ok && (sz[0] != sz[1] || memcmp(out[0], out[1], (size_t)sz[0]) != 0)) {
-        printf("Failed: level 99 produced a different stream than level %d (%ld vs %ld bytes)\n",
-               ZXC_LEVEL_ULTRA, sz[0], sz[1]);
-        ok = 0;
+    for (int i = 0; i < 4 && ok; i += 2) {
+        if (sz[i] != sz[i + 1] || memcmp(out[i], out[i + 1], (size_t)sz[i]) != 0) {
+            printf(
+                "Failed: level %d produced a different stream than level %d (%ld vs %ld bytes)\n",
+                levels[i + 1], levels[i], sz[i], sz[i + 1]);
+            ok = 0;
+        }
     }
 
-    free(out[0]);
-    free(out[1]);
+    for (int i = 0; i < 4; i++) free(out[i]);
     free(input);
     if (ok) printf("PASS\n\n");
     return ok;
@@ -1508,7 +1507,7 @@ static int dstream_finishes(const uint8_t* arc, size_t alen, uint8_t* out, size_
  * That order the other way round is what made Windows read a truncated frame. */
 int test_stream_size_then_decompress(void) {
     printf("=== TEST: Stream - stored-size lookup then decode, same stream ===\n");
-    const size_t n = 600u * 1024u; /* > 1 block at the 512 KB default */
+    const size_t n = 600U * 1024U; /* > 1 block at the 512 KB default */
     const char* const path = "zxc_size_then_decode.tmp";
     uint8_t* const src = malloc(n);
     uint8_t* const out = malloc(n);
@@ -1549,8 +1548,8 @@ int test_stream_size_then_decompress(void) {
         FILE* const f_arc = fopen(path, "rb");
         char* buf = NULL;
         if (f_arc && buffered) {
-            buf = malloc(1u << 16);
-            if (buf) setvbuf(f_arc, buf, _IOFBF, 1u << 16);
+            buf = malloc(1U << 16);
+            if (buf) setvbuf(f_arc, buf, _IOFBF, 1U << 16);
         }
         FILE* const f_out = tmpfile();
         int64_t reported = -1, got = -1;
@@ -1604,19 +1603,29 @@ int test_stream_size_then_decompress(void) {
 
 int test_stream_footer_looks_like_sek(void) {
     printf("=== TEST: Stream - a footer that parses as a SEK header ===\n");
+    /* Footer bytes with the SEK type and a valid checksum, but Flags/Reserved set. */
     uint64_t n = 0;
-    for (uint64_t k = ZXC_BLOCK_SEK; k < (1u << 24) && !n; k += 256) {
+    for (uint64_t k = ZXC_BLOCK_SEK; k < (1U << 24) && !n; k += 256) {
         uint8_t b[8];
         zxc_store_le64(b, k);
-        zxc_block_header_t bh;
-        if (zxc_read_block_header(b, sizeof(b), &bh) == ZXC_OK && bh.block_type == ZXC_BLOCK_SEK)
-            n = k;
+        const uint8_t sum = b[7];
+        b[7] = 0;
+        if (sum == zxc_hash8(b)) n = k;
     }
     if (!n) {
         printf("  [FAIL] no such size below 16 MiB\n");
         return 0;
     }
-    printf("  size %llu bytes parses as a SEK header\n", (unsigned long long)n);
+    {
+        uint8_t b[8];
+        zxc_store_le64(b, n);
+        zxc_block_header_t bh;
+        if (zxc_read_block_header(b, sizeof(b), &bh) != ZXC_ERROR_BAD_HEADER) {
+            printf("  [FAIL] size %llu parses as a SEK header\n", (unsigned long long)n);
+            return 0;
+        }
+    }
+    printf("  size %llu bytes hashes like a SEK header\n", (unsigned long long)n);
 
     uint8_t* const src = malloc((size_t)n);
     uint8_t* const out = malloc((size_t)n);

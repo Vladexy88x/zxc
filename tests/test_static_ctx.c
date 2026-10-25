@@ -209,14 +209,14 @@ int test_static_ctx_block_size_locked(void) {
     printf("=== TEST: Static Context API - block_size lock ===\n");
 
     const size_t pinned_bs = 64 * 1024;
-    const size_t ws_sz = zxc_static_cctx_workspace_size(pinned_bs, ZXC_LEVEL_DEFAULT);
+    const size_t ws_sz = zxc_static_cctx_workspace_size(pinned_bs, ZXC_LEVEL_DENSITY);
     void* const ws = test_aligned_alloc(64, ws_sz);
     if (!ws) {
         printf("  [FAIL] aligned_alloc\n");
         return 0;
     }
 
-    zxc_compress_opts_t opts = {.level = ZXC_LEVEL_DEFAULT, .block_size = pinned_bs};
+    zxc_compress_opts_t opts = {.level = ZXC_LEVEL_DENSITY, .block_size = pinned_bs};
     zxc_cctx* const cctx = zxc_init_static_cctx(ws, ws_sz, &opts);
     if (!cctx) {
         printf("  [FAIL] init_static_cctx\n");
@@ -240,6 +240,27 @@ int test_static_ctx_block_size_locked(void) {
     const int64_t rc2 = zxc_compress_cctx(cctx, src, sizeof(src), dst, sizeof(dst), NULL);
     if (rc2 <= 0) {
         printf("  [FAIL] same-block_size compress returned %lld\n", (long long)rc2);
+        zxc_free_cctx(cctx);
+        test_aligned_free(ws);
+        return 0;
+    }
+
+    /* Zero fields mean the pinned values, not the last call's (#532): level 3
+     * first, so the two differ. */
+    uint8_t ref[1024];
+    const zxc_compress_opts_t lvl3 = {.level = 3, .block_size = pinned_bs};
+    if (zxc_compress_cctx(cctx, src, sizeof(src), dst, sizeof(dst), &lvl3) <= 0) {
+        printf("  [FAIL] level-3 call on the pinned context\n");
+        zxc_free_cctx(cctx);
+        test_aligned_free(ws);
+        return 0;
+    }
+    const zxc_compress_opts_t zero = {0};
+    const int64_t rc3 = zxc_compress_cctx(cctx, src, sizeof(src), dst, sizeof(dst), &zero);
+    const int64_t rc4 = zxc_compress(src, sizeof(src), ref, sizeof(ref), &opts);
+    if (rc3 <= 0 || rc3 != rc4 || memcmp(dst, ref, (size_t)rc3) != 0) {
+        printf("  [FAIL] zero opts on a pinned context: %lld, one-shot %lld\n", (long long)rc3,
+               (long long)rc4);
         zxc_free_cctx(cctx);
         test_aligned_free(ws);
         return 0;
@@ -525,7 +546,7 @@ int test_static_dctx_block_bounds(void) {
         NB
     };
     const size_t cap = (size_t)zxc_compress_block_bound(SEQ);
-    uint8_t* lz = (uint8_t*)malloc(XL);   /* compressible: GLO */
+    uint8_t* lz = (uint8_t*)malloc(XL);   /* compressible: SPL */
     uint8_t* rnd = (uint8_t*)malloc(XL);  /* incompressible: RAW */
     uint8_t* lit = (uint8_t*)malloc(LIT); /* 16-symbol text, then a repeat: many literals */
     uint8_t* seq = (uint8_t*)malloc(SEQ); /* 23 fixed bytes + 1 random: thousands of matches */
@@ -546,7 +567,7 @@ int test_static_dctx_block_bounds(void) {
             printf("  [FAIL] setup\n");
             break;
         }
-        zxc_test_srand(0x5747u);
+        zxc_test_srand(0x5747U);
         gen_lz_data(lz, XL);
         gen_random_data(rnd, XL);
         for (size_t i = 0; i < LIT - 1000; i++)
@@ -565,9 +586,9 @@ int test_static_dctx_block_bounds(void) {
             const zxc_compress_opts_t* opts;
         } plan[NB] = {{"fit", lz, PIN, &l3},
                       {"fit+checksum", lz, PIN, &l3ck},
-                      {"GLO 5000", lz, MID, &l3},
+                      {"SPL 5000", lz, MID, &l3},
                       {"RAW 5000", rnd, MID, &l3},
-                      {"GLO 8000", lz, XL, &l3},
+                      {"SPL 8000", lz, XL, &l3},
                       {"RAW 8000", rnd, XL, &l3},
                       {"literals L6", lit, LIT, &l6},
                       {"literals L1", lit, LIT, &l1},
@@ -597,8 +618,8 @@ int test_static_dctx_block_bounds(void) {
             zxc_store_le32(blocks[i].comp + ZXC_BLOCK_HEADER_SIZE + 4, PIN + 1);
         }
         if (blocks[B_RAW_MID].comp[0] != ZXC_BLOCK_RAW ||
-            blocks[B_RAW_XL].comp[0] != ZXC_BLOCK_RAW || blocks[B_LIT6].comp[0] != ZXC_BLOCK_GLO ||
-            blocks[B_LIT1].comp[0] != ZXC_BLOCK_GHI) {
+            blocks[B_RAW_XL].comp[0] != ZXC_BLOCK_RAW || blocks[B_LIT6].comp[0] != ZXC_BLOCK_SPL ||
+            blocks[B_LIT1].comp[0] != ZXC_BLOCK_PAK) {
             printf("  [FAIL] block types: RAW %u %u, literals %u %u\n", blocks[B_RAW_MID].comp[0],
                    blocks[B_RAW_XL].comp[0], blocks[B_LIT6].comp[0], blocks[B_LIT1].comp[0]);
             break;
@@ -713,7 +734,7 @@ int test_static_dctx_block_bounds(void) {
             const zxc_decompress_opts_t* o = pass ? &ck : NULL;
             for (size_t bit = 0; bit < (size_t)b->n * 8; bit++, flips++) {
                 memcpy(mut, b->comp, (size_t)b->n);
-                mut[bit >> 3] ^= (uint8_t)(1u << (bit & 7));
+                mut[bit >> 3] ^= (uint8_t)(1U << (bit & 7));
                 const int64_t rs = zxc_decompress_block(sd, mut, (size_t)b->n, out, PIN, o);
                 const int64_t rd = zxc_decompress_block(hd, mut, (size_t)b->n, out2, PIN, o);
                 const int same = rs == rd && (rs <= 0 || memcmp(out, out2, (size_t)rs) == 0);
@@ -839,7 +860,7 @@ static int64_t inplace_refusal(zxc_dctx* d, const uint8_t* src, size_t n, size_t
 int test_static_dctx_inplace(void) {
     printf("=== TEST: Static Context API - in-place decode ===\n");
 
-    const size_t N = 1u << 20;
+    const size_t N = 1U << 20;
     uint8_t* const text = (uint8_t*)malloc(N);
     uint8_t* const noise = (uint8_t*)malloc(N);
     if (!text || !noise) {
