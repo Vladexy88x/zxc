@@ -2156,5 +2156,33 @@ else
 fi
 rm -f "$CASE_IN"
 
+# 42. An output that is a hard link to the input: Windows would truncate the
+#     input through it, so it is refused; POSIX replaces the link, input kept
+echo "Testing -f -o onto a hard link to the input..."
+LINK_IN="$TEST_DIR/link_in.txt"
+LINK_OUT="$TEST_DIR/link_out.txt"
+cp "${TEST_FILE}.orig" "$LINK_IN"
+rm -f "$LINK_OUT"
+if ! ln "$LINK_IN" "$LINK_OUT" 2>/dev/null || [[ "$(stat -c '%h' "$LINK_IN" 2>/dev/null || stat -f '%l' "$LINK_IN")" != 2 ]]; then
+    echo "  [SKIP] hard links not supported here"
+elif [[ $IS_WINDOWS -eq 1 ]]; then
+    if "$ZXC_BIN" -q -k -f -o "$LINK_OUT" "$LINK_IN" 2>/dev/null; then
+        log_fail "-f -o onto a hard link to the input was not refused"
+    elif cmp -s "$LINK_IN" "${TEST_FILE}.orig"; then
+        log_pass "-f -o onto a hard link to the input is refused, input kept"
+    else
+        log_fail "-f -o onto a hard link to the input destroyed it"
+    fi
+else
+    if ! "$ZXC_BIN" -q -k -f -o "$LINK_OUT" "$LINK_IN" 2>/dev/null; then
+        log_fail "-f -o onto a hard link to the input was refused"
+    elif cmp -s "$LINK_IN" "${TEST_FILE}.orig" && "$ZXC_BIN" -d -c "$LINK_OUT" | cmp -s - "${TEST_FILE}.orig"; then
+        log_pass "-f -o onto a hard link to the input replaces the link, input kept"
+    else
+        log_fail "-f -o onto a hard link to the input lost data"
+    fi
+fi
+rm -f "$LINK_IN" "$LINK_OUT"
+
 echo "All tests passed!"
 exit 0

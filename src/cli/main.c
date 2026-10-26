@@ -1224,6 +1224,41 @@ static FILE* zxc_create_output(const char* path, int force, int owner_only, int*
 #endif
 }
 
+#ifdef _WIN32
+/** @brief A file's identity: volume serial and file ID, tagged by how it was read. */
+typedef struct {
+    int kind;  // 1: FileIdInfo, 2: file index
+    ULONGLONG volume;
+    BYTE id[16];
+} zxc_file_id_t;
+
+/**
+ * @brief Reads the identity of the file open as @p h.
+ *
+ * The 128-bit FileIdInfo first: the 64-bit file index is not unique on ReFS.
+ * Both names of one file are on one filesystem, so they get the same kind.
+ */
+static int zxc_get_file_id(HANDLE h, zxc_file_id_t* fid) {
+    memset(fid, 0, sizeof(*fid));
+#if _WIN32_WINNT >= 0x0602
+    FILE_ID_INFO fi;
+    if (GetFileInformationByHandleEx(h, FileIdInfo, &fi, sizeof(fi))) {
+        fid->kind = 1;
+        fid->volume = fi.VolumeSerialNumber;
+        memcpy(fid->id, &fi.FileId, sizeof(fi.FileId));
+        return 1;
+    }
+#endif
+    BY_HANDLE_FILE_INFORMATION bi;
+    if (!GetFileInformationByHandle(h, &bi)) return 0;
+    fid->kind = 2;
+    fid->volume = bi.dwVolumeSerialNumber;
+    memcpy(fid->id, &bi.nFileIndexLow, sizeof(bi.nFileIndexLow));
+    memcpy(fid->id + 4, &bi.nFileIndexHigh, sizeof(bi.nFileIndexHigh));
+    return 1;
+}
+#endif
+
 /**
  * @brief Whether @p path already names the file open as @p in, whatever its
  *        spelling (letter case, 8.3 short name, a link on Windows).
@@ -1235,16 +1270,15 @@ static FILE* zxc_create_output(const char* path, int force, int owner_only, int*
  */
 static int zxc_is_input_file(FILE* in, const char* path) {
 #ifdef _WIN32
-    BY_HANDLE_FILE_INFORMATION a, b;
+    zxc_file_id_t a, b;
     const HANDLE hin = (HANDLE)_get_osfhandle(_fileno(in));
-    if (hin == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(hin, &a)) return 0;
+    if (hin == INVALID_HANDLE_VALUE || !zxc_get_file_id(hin, &a)) return 0;
     const HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                  NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;  // no output yet
-    const int ok = GetFileInformationByHandle(h, &b);
+    const int ok = zxc_get_file_id(h, &b);
     CloseHandle(h);
-    return ok && a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
-           a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+    return ok && memcmp(&a, &b, sizeof(a)) == 0;
 #else
     struct stat a, b;
     return fstat(fileno(in), &a) == 0 && lstat(path, &b) == 0 && a.st_dev == b.st_dev &&
